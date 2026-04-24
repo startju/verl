@@ -217,6 +217,10 @@ class ToolAgentLoop(AgentLoopBase):
             max_global_steps = output.extra_fields.get("max_global_steps", None)
             if max_global_steps:
                 agent_data.extra_fields["max_global_steps"] = max_global_steps
+        if output.stop_reason is not None:
+            agent_data.extra_fields["stop_reason"] = output.stop_reason
+        else:
+            agent_data.extra_fields.pop("stop_reason")
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
