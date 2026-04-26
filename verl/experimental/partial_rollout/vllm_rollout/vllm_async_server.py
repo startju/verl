@@ -51,15 +51,16 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
     ) -> TokenOutput:
         async with self.lock:
             if self.paused:
-                return None, True
+                return TokenOutput(stop_reason="aborted", extra_fields={"stop_reason": "aborted"})
             self.token_output_dict[request_id] = None
             self.cancel_event_dict[request_id] = asyncio.Event()
 
             async def _generate():
-                self.token_output_dict[request_id] = await self.generate(
+                self.token_output_dict[request_id] = await super().generate(
                     prompt_ids, sampling_params, request_id, image_data, video_data
                 )
-            generate_handle = asyncio.create_task(_generate)
+
+            generate_handle = asyncio.create_task(_generate())
             cancel_handle = asyncio.create_task(self.cancel_event_dict[request_id].wait())
 
         done, pend = await asyncio.wait([generate_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
@@ -73,14 +74,13 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
             if token_output is None:
                 is_cancel = True
                 await self.abort_request(request_id, True)
-                return TokenOutput(stop_reason="aborted", extra_fields={"stop_reason": "aborted"}), True
+                return TokenOutput(stop_reason="aborted", extra_fields={"stop_reason": "aborted"})
             else:
                 is_cancel = token_output.stop_reason in ("abort", "aborted")
             self.cancel_event_dict.pop(request_id, None)
             self.token_output_dict.pop(request_id, None)
-        token_output.extra_fields.update("stop_reason", token_output.stop_reason)
+        token_output.extra_fields["stop_reason"] = token_output.stop_reason
         return token_output, is_cancel
-
 
     async def cancel(self):
         async with self.lock:
@@ -91,6 +91,7 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
     async def resume(self):
         async with self.lock:
             self.paused = False
+
 
 class PRv3vLLMReplica(vLLMReplica):
     def __init__(
