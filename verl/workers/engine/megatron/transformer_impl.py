@@ -907,8 +907,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
                 logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
                 ret = {}
-                # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy,
-                # which mutates logits in place via exp_().
+                # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
                 if calculate_sum_pi_squared:
                     ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
                 if calculate_entropy:
