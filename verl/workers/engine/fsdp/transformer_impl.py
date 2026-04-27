@@ -1063,12 +1063,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # compute sum_pi_squared (Σπ²) for optimal-baseline advantage estimators
                 if calculate_sum_pi_squared:
-                    if not self.engine_config.sum_pi_squared_checkpointing:
-                        sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
-                    else:
-                        sum_pi_squared_rmpad = torch.utils.checkpoint.checkpoint(
-                            verl_F.calculate_sum_pi_squared_from_logits, logits_rmpad
-                        )
+                    sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
@@ -1138,12 +1133,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
                 if calculate_sum_pi_squared:
-                    if not self.engine_config.sum_pi_squared_checkpointing:
-                        sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
-                    else:
-                        sum_pi_squared = torch.utils.checkpoint.checkpoint(
-                            verl_F.calculate_sum_pi_squared_from_logits, logits
-                        )
+                    sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
