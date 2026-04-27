@@ -55,7 +55,7 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             for task in done:
                 running_set.remove(task)
                 rollout_prompt = task.result()
-                self.prompt_manager_handle.push_prompt.remote(rollout_prompt)
+                self.prompt_manager_handle.push_prompts.remote([rollout_prompt])
                 if not is_prompt_done(rollout_prompt):
                     is_canceled = True
             if is_canceled:

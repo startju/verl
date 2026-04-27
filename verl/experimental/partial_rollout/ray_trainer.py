@@ -67,7 +67,7 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         )
         from verl.experimental.partial_rollout.prompt_manager import RolloutPromptManager
 
-        self.rollout_prompt_manager = RolloutPromptManager.remote()
+        self.rollout_prompt_manager = RolloutPromptManager.remote(self.config, self.tokenizer)
         RayPPOTrainer.init_workers(self)
         self.async_rollout_manager.init_agent_loop_workers(self.rollout_prompt_manager)
 
@@ -89,7 +89,7 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             gen_batch = self._get_gen_batch(batch)
             # pass global_steps to trace
             gen_batch.meta_info["global_steps"] = self.global_steps
-            need_more = ray.get(self.rollout_prompt_manager.push_pending_prompts.remote(batch, gen_batch))
+            need_more = ray.get(self.rollout_prompt_manager.push_batch.remote(batch, gen_batch))
 
         gen_batch_output = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
