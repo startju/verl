@@ -1,3 +1,17 @@
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Any
 from uuid import uuid4
 
@@ -49,7 +63,7 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
             )
 
         if metrics.get("num_preempted") is None:
-                metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
         if not last_agent_loop_output.prompt_ids:
