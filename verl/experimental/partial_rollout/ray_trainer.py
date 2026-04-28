@@ -75,14 +75,20 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         metrics = self.metrics
         timing_raw = self.timing_raw
 
-        need_more = False
+        need_more = True
         while need_more:
             try:
                 batch_dict = next(data_loader_iter)
             except StopIteration:
-                # make n length dummy
+                # Loader exhausted: build a dummy gen_batch so the rest of this
+                # step still runs and any in-flight prompts in rollout_prompt_manager
+                # can be drained via generate_sequences/pull_batch.
+                # global_steps is required by PRv3 generate_sequences (asserted
+                # in agent_loop.py); the rest of meta_info is unused here since
+                # generate_sequences pulls real batches from rollout_prompt_manager.
                 gen_batch = DataProto(
-                    batch=TensorDict({}, batch_size=(self.train_dataloader.batch_size,)), meta_info={}
+                    batch=TensorDict({}, batch_size=(self.train_dataloader.batch_size,)),
+                    meta_info={"global_steps": self.global_steps},
                 )
                 break
             batch = self._fit_get_batch(batch_dict)
@@ -196,9 +202,20 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         self.next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                self.epoch = epoch
-                self.fit_step(batch_dict)
+            # Pass the iterator (not individual batch_dicts) into fit_step:
+            # _fit_generate consumes as many dataloader items as the prompt
+            # manager will accept per step (backpressure-driven), so each
+            # fit_step may pull multiple batches. Cap fit_step calls at
+            # len(self.train_dataloader) per epoch to preserve the parent's
+            # one-step-per-batch count, give the outer for-loop a chance to
+            # advance epochs, and avoid deadlocking once data_loader_iter and
+            # rollout_prompt_manager are both drained. After the iter is
+            # exhausted, _fit_generate produces a dummy gen_batch so
+            # generate_sequences can keep draining manager-side work.
+            self.epoch = epoch
+            data_loader_iter = iter(self.train_dataloader)
+            for _ in range(len(self.train_dataloader)):
+                self.fit_step(data_loader_iter)
                 if self.is_last_step:
                     return
 
