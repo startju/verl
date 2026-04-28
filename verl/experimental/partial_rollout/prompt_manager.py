@@ -20,7 +20,7 @@ from typing import Any
 import ray
 from omegaconf import DictConfig
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 from verl.experimental.fully_async_policy.detach_utils import RolloutSample, assemble_batch_from_rollout_samples
 from verl.protocol import DataProto
 
@@ -170,17 +170,24 @@ class RolloutPromptManager:
                     batch=prompt_batch,
                     gen_batch_output=prompt_gen_batch.repeat(repeat_times=n, interleave=True),
                     prompt_id=prompt_ids[i],
-                    # Sentinel AgentLoopOutputs: only `extra_fields["stop_reason"]`
-                    # is read by the first _run_agent_loop call (to detect that
-                    # this is a fresh prompt that needs full rollout). The real
-                    # AgentLoopOutput overwrites this whole list when the worker
-                    # finishes — so we use model_construct to skip pydantic's
-                    # required-field validation rather than fabricate dummy
-                    # prompt_ids/response_ids/metrics.
-                    # NOTE: model_construct is a pydantic-internal API; if
-                    # AgentLoopOutput migrates off pydantic this needs revisiting.
+                    # Sentinel AgentLoopOutputs for a fresh prompt. Two signals
+                    # the first _run_agent_loop call relies on:
+                    #   - extra_fields["stop_reason"] == "aborted"  → not yet done,
+                    #     run a rollout (vs. passing a finished output through).
+                    #   - prompt_ids == []                          → fresh prompt
+                    #     (vs. resuming a previously-aborted partial generation).
+                    # All other fields are valid empties so the agent loop can
+                    # read them without AttributeError. The real AgentLoopOutput
+                    # overwrites this whole list once the worker finishes.
                     agent_loop_output_list=[
-                        AgentLoopOutput.model_construct(extra_fields={"stop_reason": "aborted"}) for _ in range(n)
+                        AgentLoopOutput(
+                            prompt_ids=[],
+                            response_ids=[],
+                            response_mask=[],
+                            metrics=AgentLoopMetrics(),
+                            extra_fields={"stop_reason": "aborted"},
+                        )
+                        for _ in range(n)
                     ],
                 )
             )

@@ -30,7 +30,7 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
                 videos=videos,
             )
         else:
-            if last_agent_loop_output.extra_fields.get("stop_reason") not in ("abort", "aborted"):
+            if last_agent_loop_output.extra_fields.get("stop_reason") != "aborted":
                 return last_agent_loop_output
             prompt_ids = last_agent_loop_output.prompt_ids + last_agent_loop_output.response_ids
             metrics["generate_sequences"] = last_agent_loop_output.metrics.generate_sequences
