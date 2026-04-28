@@ -14,26 +14,35 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
+import hydra
 import numpy as np
 import ray
 from omegaconf import DictConfig
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker, get_trajectory_info
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopManager,
+    AgentLoopOutput,
+    AgentLoopWorker,
+    DictConfigWrap,
+    _agent_loop_registry,
+    get_trajectory_info,
+)
 from verl.experimental.partial_rollout.prompt_manager import RolloutPrompt, RolloutPromptManager, is_prompt_done
 from verl.experimental.partial_rollout.vllm_rollout.vllm_async_server import PRv3vLLMReplica
 from verl.experimental.teacher_loop.teacher_model import MultiTeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
-from verl.utils.rollout_trace import RolloutTraceConfig
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 
 logger = logging.getLogger(__file__)
 logger.setLevel("INFO")
 
 
+@ray.remote
 class PRv3AgentLoopWorker(AgentLoopWorker):
     def __init__(
         self,
@@ -56,8 +65,8 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         self.prompt_manager_handle = prompt_manager_handle
 
     async def run_generate_sequences(self, max_inflight_prompts: int):
-        rollout_prompts: list[RolloutPrompt] = ray.get(
-            self.prompt_manager_handle.pull_prompts.remote(max_inflight_prompts)
+        rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
+            max_inflight_prompts
         )
 
         running_set: set[asyncio.Task] = {
@@ -75,14 +84,13 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                     is_canceled = True
             if is_canceled:
                 continue
-            new_rollout_prompts: list[RolloutPrompt] = ray.get(
-                self.prompt_manager_handle.pull_prompts.remote(len(done))
-            )
+            new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(len(done))
             running_set.update(
                 asyncio.create_task(self._generate_sequences_for_prompt(rp)) for rp in new_rollout_prompts
             )
 
-    async def _generate_sequences_for_prompt(self, rollout_promput: RolloutPrompt) -> RolloutPrompt:
+    # copy from AgentLoopWorker generate_sequences
+    async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt) -> RolloutPrompt:
         """Generate sequences from agent loop.
 
         Args:
@@ -103,8 +111,8 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
-        batch = rollout_promput.gen_batch_output
-        agent_loop_output_list = rollout_promput.agent_loop_output_list
+        batch = rollout_prompt.gen_batch_output
+        agent_loop_output_list = rollout_prompt.agent_loop_output_list
         config = self.rollout_config
         sampling_params = dict(
             temperature=config.temperature,
@@ -157,14 +165,65 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             kwargs["last_agent_loop_output"] = agent_loop_output_list[i]
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop_no_post(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        internal_agent_loop_output_list = await asyncio.gather(*tasks)
-        if is_prompt_done(rollout_promput):
-            rollout_promput.gen_batch_output = self._postprocess(internal_agent_loop_output_list)
-            rollout_promput.agent_loop_output_list = []
-        return rollout_promput
+        rollout_prompt.agent_loop_output_list = await asyncio.gather(*tasks)
+        if is_prompt_done(rollout_prompt):
+            coros = []
+            for i in range(len(batch)):
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                coros.append(
+                    self._agent_loop_postprocess(
+                        rollout_prompt.agent_loop_output_list[i], trajectory_info[i]["validate"], **kwargs
+                    )
+                )
+            internal_agent_loop_output_list = await asyncio.gather(*coros)
+            rollout_prompt.gen_batch_output = self._postprocess(
+                internal_agent_loop_output_list,
+                input_non_tensor_batch=batch.non_tensor_batch,
+                validate=batch.meta_info.get("validate", False),
+            )
+            rollout_prompt.agent_loop_output_list = []
+        return rollout_prompt
+
+    # copy from AgentLoopWorker._run_agent_loop without call _agent_loop_postprocess
+    async def _run_agent_loop_no_post(
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        trace: bool = True,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        with rollout_trace_attr(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
+            trace=trace,
+        ):
+            assert agent_name in _agent_loop_registry, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            )
+            assert agent_name.startswith("prv3_"), (
+                f"partial rollout requires a PRv3-aware agent loop (consumes `last_agent_loop_output` to resume "
+                f"after abort), got {agent_name!r}; otherwise resume silently degrades to full rollout"
+            )
+
+            agent_loop_config = _agent_loop_registry[agent_name]
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=DictConfigWrap(config=self.config),
+                server_manager=self.server_manager,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                dataset_cls=self.dataset_cls,
+                data_config=DictConfigWrap(self.config.data),
+            )
+            return await agent_loop.run(sampling_params, **kwargs)
 
 
 class PRv3AgentLoopManager(AgentLoopManager):
@@ -180,6 +239,8 @@ class PRv3AgentLoopManager(AgentLoopManager):
         self.agent_loop_workers_class = PRv3AgentLoopWorker
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
 
+    # copy from AgentLoopManager.create, not call _init_agent_loop_workers
+    # we need call init_agent_loop_workers manually
     @classmethod
     @auto_await
     async def create(
@@ -202,6 +263,7 @@ class PRv3AgentLoopManager(AgentLoopManager):
         self.rollout_prompt_manager = rollout_prompt_manager
         await self._init_agent_loop_workers()
 
+    # copy from AgentLoopManager._init_agent_loop_workers, add rollout_prompt_manager params to build agent_loop_worker
     async def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.rollout_config.agent.num_workers
@@ -268,11 +330,12 @@ class PRv3AgentLoopManager(AgentLoopManager):
         ]
 
         while True:
-            output = ray.get(self.rollout_prompt_manager.pull_batch.remote())
+            output = await self.rollout_prompt_manager.pull_batch.remote()
             if output:
                 break
+            await asyncio.sleep(0.01)
         await self.cancel()
-        ray.get(worker_tasks)
+        await asyncio.gather(*worker_tasks)
 
         # calculate performance metrics
         outputs = [output]
