@@ -64,13 +64,13 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         )
         self.prompt_manager_handle = prompt_manager_handle
 
-    async def run_generate_sequences(self, max_inflight_prompts: int):
+    async def run_generate_sequences(self, max_inflight_prompts: int, global_steps: int):
         rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
             max_inflight_prompts
         )
 
         running_set: set[asyncio.Task] = {
-            asyncio.create_task(self._generate_sequences_for_prompt(rp)) for rp in rollout_prompts
+            asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in rollout_prompts
         }
 
         is_canceled = False
@@ -86,11 +86,11 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 continue
             new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(len(done))
             running_set.update(
-                asyncio.create_task(self._generate_sequences_for_prompt(rp)) for rp in new_rollout_prompts
+                asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in new_rollout_prompts
             )
 
     # copy from AgentLoopWorker generate_sequences
-    async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt) -> RolloutPrompt:
+    async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt, global_steps: int) -> RolloutPrompt:
         """Generate sequences from agent loop.
 
         Args:
@@ -159,9 +159,21 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         )
 
         tasks = []
+        # Track the weight-version range used to generate each sample across the
+        # potentially many aborted-and-resumed worker rounds this prompt goes through.
+        # min defaults to the current global_steps so a fresh sample records "started here";
+        # on resume it carries over the earliest round's value from prior extra_fields.
+        # max stays None until a round finishes non-aborted — aborted rounds intentionally
+        # leave max unset so a later resume round can fill it in.
+        min_global_steps: list[int] = [global_steps] * len(batch)
+        max_global_steps: list[Optional[int]] = [None] * len(batch)
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            if "min_global_steps" in agent_loop_output_list[i].extra_fields:
+                min_global_steps[i] = agent_loop_output_list[i].extra_fields["min_global_steps"]
+            if "max_global_steps" in agent_loop_output_list[i].extra_fields:
+                max_global_steps[i] = agent_loop_output_list[i].extra_fields["max_global_steps"]
             kwargs["last_agent_loop_output"] = agent_loop_output_list[i]
             tasks.append(
                 asyncio.create_task(
@@ -169,6 +181,13 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 )
             )
         rollout_prompt.agent_loop_output_list = await asyncio.gather(*tasks)
+        for i in range(len(batch)):
+            rollout_prompt.agent_loop_output_list[i].extra_fields["min_global_steps"] = min_global_steps[i]
+            if max_global_steps[i] is not None:
+                rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = max_global_steps[i]
+            elif rollout_prompt.agent_loop_output_list[i].stop_reason != "aborted":
+                rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = global_steps
+
         if is_prompt_done(rollout_prompt):
             coros = []
             for i in range(len(batch)):
@@ -322,11 +341,17 @@ class PRv3AgentLoopManager(AgentLoopManager):
         if prompts.meta_info.get("validate", False):
             return await super().generate_sequences(prompts)
 
+        assert "global_steps" in prompts.meta_info, (
+            "PRv3 generate_sequences requires meta_info['global_steps'] to track per-sample weight-version range"
+        )
+        global_steps = prompts.meta_info["global_steps"]
+
         num_rollout_prompts = prompts.batch.size(0) // self.config.actor_rollout_ref.rollout.n
 
         max_inflight_prompts = (num_rollout_prompts + len(self.agent_loop_workers) - 1) // len(self.agent_loop_workers)
         worker_tasks = [
-            worker.run_generate_sequences.remote(max_inflight_prompts) for worker in self.agent_loop_workers
+            worker.run_generate_sequences.remote(max_inflight_prompts, global_steps)
+            for worker in self.agent_loop_workers
         ]
 
         while True:
