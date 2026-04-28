@@ -34,6 +34,9 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
                 return last_agent_loop_output
             prompt_ids = last_agent_loop_output.prompt_ids + last_agent_loop_output.response_ids
             metrics["generate_sequences"] = last_agent_loop_output.metrics.generate_sequences
+            multi_modal_data = last_agent_loop_output.multi_modal_data or {}
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
 
         # 3. generate sequences
         with simple_timer("generate_sequences", metrics):
@@ -45,10 +48,11 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
                 video_data=videos,
             )
 
-        response_mask = [1] * len(output.token_ids)
-        if not last_agent_loop_output.prompt_ids:
-            if metrics.get("num_preempted") is None:
+        if metrics.get("num_preempted") is None:
                 metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        response_mask = [1] * len(output.token_ids)
+
+        if not last_agent_loop_output.prompt_ids:
             output: AgentLoopOutput = AgentLoopOutput(
                 prompt_ids=prompt_ids,
                 response_ids=output.token_ids[: self.response_length],
@@ -65,28 +69,18 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
                 extra_fields=output.extra_fields,
             )
         else:
-            if metrics.get("num_preempted") is None:
-                metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-            elif output.num_preempted is not None:
-                if metrics["num_preempted"] == -1:
-                    metrics["num_preempted"] = output.num_preempted
-                else:
-                    metrics["num_preempted"] += output.num_preempted
-            else:
-                metrics["num_preempted"] = -1
-
             prompt_ids = last_agent_loop_output.prompt_ids
             response_ids = last_agent_loop_output.response_ids + output.token_ids
             response_mask = last_agent_loop_output.response_mask + response_mask
             response_logprobs = last_agent_loop_output.response_logprobs
-            if response_logprobs is not None or output.response_logprobs is not None:
-                response_logprobs = (response_logprobs or []) + (output.response_logprobs or [])
+            if response_logprobs is not None or output.log_probs is not None:
+                response_logprobs = (response_logprobs or []) + (output.log_probs or [])
 
             output: AgentLoopOutput = AgentLoopOutput(
                 prompt_ids=prompt_ids,
                 response_ids=response_ids[: self.response_length],
                 response_mask=response_mask[: self.response_length],
-                response_logprobs=response_logprobs[: self.response_length] if output.log_probs else None,
+                response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
                 routed_experts=(
                     output.routed_experts[: len(prompt_ids) + self.response_length]
                     if output.routed_experts is not None
