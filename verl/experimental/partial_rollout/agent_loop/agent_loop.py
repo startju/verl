@@ -1,6 +1,20 @@
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Optional
 from uuid import uuid4
 
 import numpy as np
@@ -9,6 +23,7 @@ from omegaconf import DictConfig
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker, get_trajectory_info
 from verl.experimental.partial_rollout.prompt_manager import RolloutPrompt, RolloutPromptManager, is_prompt_done
+from verl.experimental.partial_rollout.vllm_rollout.vllm_async_server import PRv3vLLMReplica
 from verl.experimental.teacher_loop.teacher_model import MultiTeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
@@ -46,12 +61,12 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         )
 
         running_set: set[asyncio.Task] = {
-            asyncio.create_task(self._generate_sequences_for_prompt(rp) for rp in rollout_prompts)
+            asyncio.create_task(self._generate_sequences_for_prompt(rp)) for rp in rollout_prompts
         }
 
         is_canceled = False
         while running_set:
-            done, _ = asyncio.wait(running_set, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(running_set, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 running_set.remove(task)
                 rollout_prompt = task.result()
@@ -64,7 +79,7 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 self.prompt_manager_handle.pull_prompts.remote(len(done))
             )
             running_set.update(
-                asyncio.create_task(self._generate_sequences_for_prompt(rp) for rp in new_rollout_prompts)
+                asyncio.create_task(self._generate_sequences_for_prompt(rp)) for rp in new_rollout_prompts
             )
 
     async def _generate_sequences_for_prompt(self, rollout_promput: RolloutPrompt) -> RolloutPrompt:
@@ -145,14 +160,26 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        rollout_promput.agent_loop_output_list = await asyncio.gather(*tasks)
+        internal_agent_loop_output_list = await asyncio.gather(*tasks)
         if is_prompt_done(rollout_promput):
-            rollout_promput.gen_batch_output = self._postprocess(rollout_promput.agent_loop_output_list)
+            rollout_promput.gen_batch_output = self._postprocess(internal_agent_loop_output_list)
             rollout_promput.agent_loop_output_list = []
         return rollout_promput
 
 
 class PRv3AgentLoopManager(AgentLoopManager):
+    def __init__(
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool: RayResourcePool = None,
+        teacher_model_manager: MultiTeacherModelManager = None,
+        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+    ):
+        self.rollout_replica_class = PRv3vLLMReplica
+        self.agent_loop_workers_class = PRv3AgentLoopWorker
+        super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+
     @classmethod
     @auto_await
     async def create(
@@ -170,6 +197,7 @@ class PRv3AgentLoopManager(AgentLoopManager):
         # await instance._init_agent_loop_workers()
         return instance
 
+    @auto_await
     async def init_agent_loop_workers(self, rollout_prompt_manager: RolloutPromptManager):
         self.rollout_prompt_manager = rollout_prompt_manager
         await self._init_agent_loop_workers()
@@ -228,23 +256,22 @@ class PRv3AgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
-        self.resume()
+        await self.resume()
         if prompts.meta_info.get("validate", False):
-            return await super().generate_sequences(self, prompts)
+            return await super().generate_sequences(prompts)
 
         num_rollout_prompts = prompts.batch.size(0) // self.config.actor_rollout_ref.rollout.n
 
         max_inflight_prompts = (num_rollout_prompts + len(self.agent_loop_workers) - 1) // len(self.agent_loop_workers)
         worker_tasks = [
-                worker.run_generate_sequences.remote(max_inflight_prompts)
-                for worker in self.agent_loop_workers
-            ]
+            worker.run_generate_sequences.remote(max_inflight_prompts) for worker in self.agent_loop_workers
+        ]
 
         while True:
-            output = self.rollout_prompt_manager.pull_batch()
+            output = ray.get(self.rollout_prompt_manager.pull_batch.remote())
             if output:
                 break
-        self.cancel()
+        await self.cancel()
         ray.get(worker_tasks)
 
         # calculate performance metrics
@@ -254,8 +281,8 @@ class PRv3AgentLoopManager(AgentLoopManager):
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
-    def cancel(self):
-        asyncio.gather(*[replica.cancel() for replica in self.rollout_replicas])
+    async def cancel(self):
+        await asyncio.gather(*[replica.cancel() for replica in self.rollout_replicas])
 
-    def resume(self):
-        asyncio.gather(*[replica.resume() for replica in self.rollout_replicas])
+    async def resume(self):
+        await asyncio.gather(*[replica.resume() for replica in self.rollout_replicas])

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -103,6 +104,10 @@ class RolloutPromptManager:
 
     def __init__(self, config: DictConfig, tokenizer: Any):
         self.config = config
+        # tokenizer is passed straight through to assemble_batch_from_rollout_samples
+        # in pull_batch; this class never reads it. Kept on self only because the
+        # downstream call needs it. If assemble_batch_from_rollout_samples ever
+        # stops needing a tokenizer, this field can be dropped entirely.
         self.tokenizer = tokenizer
         self.batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         self.n = self.config.actor_rollout_ref.rollout.n
@@ -142,6 +147,12 @@ class RolloutPromptManager:
         in_flight_ids = (
             self.ongoing_set | {p.prompt_id for p in self.pending_queue} | {p.prompt_id for p in self.done_queue}
         )
+        # Element type is whatever non_tensor_batch["uid"] holds — usually
+        # numpy.str_ (a str subclass), occasionally a python str depending on
+        # how the upstream dataset built the column. Annotated as Any to avoid
+        # implying a stricter contract than what we actually rely on (just
+        # hashability + equality for ongoing/pending/done lookups).
+        prompt_ids: list[Any] = []
         for sample_batch in batch_list:
             prompt_id = sample_batch.non_tensor_batch["uid"][0]
             assert prompt_id not in in_flight_ids, (
@@ -149,6 +160,7 @@ class RolloutPromptManager:
                 "(ongoing/pending/done); UID collisions across calls are not supported"
             )
             in_flight_ids.add(prompt_id)
+            prompt_ids.append(prompt_id)
 
         for i in range(num_prompts):
             prompt_batch = batch_list[i]
@@ -157,7 +169,7 @@ class RolloutPromptManager:
                 RolloutPrompt(
                     batch=prompt_batch,
                     gen_batch_output=prompt_gen_batch.repeat(repeat_times=n, interleave=True),
-                    prompt_id=prompt_batch.non_tensor_batch["uid"][0],
+                    prompt_id=prompt_ids[i],
                     # Sentinel AgentLoopOutputs: only `extra_fields["stop_reason"]`
                     # is read by the first _run_agent_loop call (to detect that
                     # this is a fresh prompt that needs full rollout). The real
@@ -188,11 +200,14 @@ class RolloutPromptManager:
         """Assemble one training batch from done_queue, or return None if not enough done yet."""
         if len(self.done_queue) < self.batch_size:
             return None
-        rollout_prompts = [self.done_queue.popleft() for _ in range(self.batch_size)]
-        n = self.n
+        # Peek-then-commit: assemble can OOM during repeat/union/cat. If we
+        # popleft up front and then fail, the prompts are lost; the caller
+        # has no way to retry. Instead build the result first, only mutate
+        # done_queue once assemble has returned successfully.
+        rollout_prompts = list(itertools.islice(self.done_queue, self.batch_size))
         rollout_samples = []
         for rp in rollout_prompts:
-            full_batch = rp.batch.repeat(repeat_times=n, interleave=True).union(rp.gen_batch_output)
+            full_batch = rp.batch.repeat(repeat_times=self.n, interleave=True).union(rp.gen_batch_output)
             # epoch=0 is a placeholder: RolloutSample.epoch is required by the
             # dataclass but not read by assemble_batch_from_rollout_samples,
             # and partial rollout doesn't propagate epoch through this queue.
@@ -200,11 +215,14 @@ class RolloutPromptManager:
                 RolloutSample(full_batch=full_batch, sample_id=rp.prompt_id, epoch=0, rollout_status={})
             )
 
-        return assemble_batch_from_rollout_samples(
+        result = assemble_batch_from_rollout_samples(
             rollout_samples,
             self.tokenizer,
             self.config,
         )
+        for _ in range(self.batch_size):
+            self.done_queue.popleft()
+        return result
 
     def pull_prompts(self, max_count: int) -> list[RolloutPrompt]:
         """Hand at most max_count prompts to a worker; moves them pending → ongoing."""
@@ -214,9 +232,12 @@ class RolloutPromptManager:
         # guard + push_prompts removing from ongoing_set before requeue) this
         # assert should never fire; kept to catch internal bugs early without
         # leaving the actor with prompts popped but not tracked.
-        for i in range(take):
-            pid = self.pending_queue[i].prompt_id
-            assert pid not in self.ongoing_set, f"prompt {pid} already in ongoing_set"
+        # Use islice instead of indexed access — deque[i] is O(i), so an
+        # indexed loop here would be O(take^2).
+        for prompt in itertools.islice(self.pending_queue, take):
+            assert prompt.prompt_id not in self.ongoing_set, (
+                f"prompt {prompt.prompt_id} already in ongoing_set"
+            )
 
         pending_prompts = [self.pending_queue.popleft() for _ in range(take)]
         self.ongoing_set.update(p.prompt_id for p in pending_prompts)
@@ -239,9 +260,11 @@ class RolloutPromptManager:
             seen.add(prompt.prompt_id)
             done_flags.append(is_prompt_done(prompt))
 
-        for prompt, done in zip(prompts, done_flags, strict=True):
-            self.ongoing_set.discard(prompt.prompt_id)
-            if done:
+        for prompt, is_done in zip(prompts, done_flags, strict=True):
+            # remove (not discard): assert above guarantees membership, so a
+            # KeyError here would mean an internal bug we want to surface.
+            self.ongoing_set.remove(prompt.prompt_id)
+            if is_done:
                 self.done_queue.append(prompt)
             else:
                 # appendleft (LIFO): an aborted prompt goes to the head so the
@@ -249,4 +272,11 @@ class RolloutPromptManager:
                 # live on the rollout server. Don't change to append() without
                 # benchmarking — the LIFO bias is a deliberate cache-locality
                 # optimization, not a fairness bug.
+                #
+                # Side effect for multi-prompt pushes: appendleft applied per
+                # iteration reverses intra-batch order in pending_queue. Today
+                # callers always push a single prompt (agent_loop.py wraps each
+                # rollout result in [prompt]) so it's invisible. If batch sizes
+                # grow, switch to extendleft(reversed(aborted_subset)) to
+                # preserve order — or decide that the reversal is fine.
                 self.pending_queue.appendleft(prompt)
