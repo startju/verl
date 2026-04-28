@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from copy import deepcopy
 from pprint import pprint
 from typing import Optional
 
@@ -24,6 +23,7 @@ from verl.experimental.partial_rollout.agent_loop.agent_loop import PRv3AgentLoo
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.debug import marked_timer
@@ -54,20 +54,33 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             resource_pool_manager,
             ray_worker_group_cls,
             processor,
+            reward_fn,
+            val_reward_fn,
             train_dataset,
             val_dataset,
             collate_fn,
             train_sampler,
             device_name,
         )
-
-    def init_workers(self):
+        # PRv3-specific override: route agent_loop_manager_class to PRv3AgentLoopManager.
+        # Done here (not in init_workers) so config setup is colocated with the rest
+        # of __init__, and init_workers stays focused on worker creation.
         self.config.actor_rollout_ref.rollout["agent"]["agent_loop_manager_class"] = (
             f"{PRv3AgentLoopManager.__module__}.{PRv3AgentLoopManager.__qualname__}"
         )
+        # Fail fast on unsupported advantage estimators rather than after a wasted rollout.
+        assert self.config.algorithm.adv_estimator != AdvantageEstimator.REMAX, (
+            "PRv3RayPPOTrainer does not support the ReMax advantage estimator yet"
+        )
+
+    def init_workers(self):
         from verl.experimental.partial_rollout.prompt_manager import RolloutPromptManager
 
         self.rollout_prompt_manager = RolloutPromptManager.remote(self.config, self.tokenizer)
+        # Skip SeparateRayPPOTrainer.init_workers (its _create_actor_rollout_classes
+        # is NotImplementedError and PRv3 doesn't override it) and go straight to
+        # RayPPOTrainer's setup, which already wires up async_rollout_manager and
+        # checkpoint_manager.
         RayPPOTrainer.init_workers(self)
         self.async_rollout_manager.init_agent_loop_workers(self.rollout_prompt_manager)
 
@@ -110,15 +123,8 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             timing_raw.update(gen_batch_output.meta_info["timing"])
             gen_batch_output.meta_info.pop("timing", None)
 
-        # TODO: support ReMax
-
-        # we don't need these, just use gen_batch_output
-        """
-        # repeat to align with repeated responses in rollout
-        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-        batch = batch.union(gen_batch_output)
-        """
-
+        # gen_batch_output already carries the repeated/unioned batch built by
+        # the agent loop, so use it directly instead of repeating + unioning here.
         batch = gen_batch_output
 
         if "response_mask" not in batch.batch.keys():
@@ -202,16 +208,11 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         self.next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            # Pass the iterator (not individual batch_dicts) into fit_step:
-            # _fit_generate consumes as many dataloader items as the prompt
-            # manager will accept per step (backpressure-driven), so each
-            # fit_step may pull multiple batches. Cap fit_step calls at
-            # len(self.train_dataloader) per epoch to preserve the parent's
-            # one-step-per-batch count, give the outer for-loop a chance to
-            # advance epochs, and avoid deadlocking once data_loader_iter and
-            # rollout_prompt_manager are both drained. After the iter is
-            # exhausted, _fit_generate produces a dummy gen_batch so
-            # generate_sequences can keep draining manager-side work.
+            # Pass the iterator (not a batch_dict) so _fit_generate can consume
+            # multiple items per step under backpressure. Cap inner iterations
+            # at len(self.train_dataloader) so epochs advance and the loop
+            # can't deadlock after data_loader_iter and rollout_prompt_manager
+            # both drain.
             self.epoch = epoch
             data_loader_iter = iter(self.train_dataloader)
             for _ in range(len(self.train_dataloader)):
