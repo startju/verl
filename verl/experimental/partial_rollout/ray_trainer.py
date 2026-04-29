@@ -15,6 +15,7 @@ from typing import Optional
 
 import ray
 import torch
+from omegaconf import open_dict
 from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
@@ -65,13 +66,18 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         # PRv3-specific override: route agent_loop_manager_class to PRv3AgentLoopManager.
         # Done here (not in init_workers) so config setup is colocated with the rest
         # of __init__, and init_workers stays focused on worker creation.
-        self.config.actor_rollout_ref.rollout["agent"]["agent_loop_manager_class"] = (
-            f"{PRv3AgentLoopManager.__module__}.{PRv3AgentLoopManager.__qualname__}"
-        )
+        # open_dict: rollout.yaml's `agent` block omits agent_loop_manager_class even
+        # though the AgentLoopConfig dataclass defines it, so the loaded node is a
+        # struct-locked plain dict that rejects new keys without escaping struct mode.
+        with open_dict(self.config.actor_rollout_ref.rollout["agent"]):
+            self.config.actor_rollout_ref.rollout["agent"]["agent_loop_manager_class"] = (
+                f"{PRv3AgentLoopManager.__module__}.{PRv3AgentLoopManager.__qualname__}"
+            )
         # Fail fast on unsupported advantage estimators rather than after a wasted rollout.
         assert self.config.algorithm.adv_estimator != AdvantageEstimator.REMAX, (
             "PRv3RayPPOTrainer does not support the ReMax advantage estimator yet"
         )
+        self.stale_trajectory_processed=0
 
     def init_workers(self):
         from verl.experimental.partial_rollout.prompt_manager import RolloutPromptManager
@@ -124,8 +130,16 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             if self.curr_step_profile:
                 self.async_rollout_manager.stop_profile()
 
-            timing_raw.update(gen_batch_output.meta_info["timing"])
-            gen_batch_output.meta_info.pop("timing", None)
+            # PRv3 manager.generate_sequences currently skips the metrics/timing
+            # block (agent_loop.py:421-424 commented out), so meta_info["timing"]
+            # may be absent. Outer marked_timer("gen", ...) above still captures
+            # the wall-clock for this stage; only the per-stage sub-timings
+            # (generate_sequences/tool_calls/compute_score) are missing.
+            timing = gen_batch_output.meta_info.pop("timing", None)
+            if timing:
+                timing_raw.update(timing)
+            self._collect_metrics_from_samples(gen_batch_output, metrics)
+            print(f"[PRv3-DBG] temperature={gen_batch_output.meta_info['temperature']}", flush=True)
 
         # gen_batch_output already carries the repeated/unioned batch built by
         # the agent loop, so use it directly instead of repeating + unioning here.
@@ -150,6 +164,24 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
         batch.meta_info["images_seqlens"] = images_seqlens_all
         return batch
+
+    def _collect_metrics_from_samples(self, batch, metrics):
+        """
+        Collect metrics from samples
+        """
+        if hasattr(batch, "meta_info") and batch.meta_info:
+            trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
+            stale_traj_count = sum(1 for v in trajectory_param_versions if self.global_steps - v >= 1)
+            self.stale_trajectory_processed += stale_traj_count
+            metrics.update(
+                {
+                    "fully_async/count/stale_trajectory_processed": self.stale_trajectory_processed,
+                    "fully_async/count/current_param_version": self.global_steps,
+                }
+            )
+            for key, value in batch.meta_info.items():
+                if key.startswith("fully_async") or key.startswith("timing_s"):
+                    metrics[key] = value
 
     def fit(self):
         """

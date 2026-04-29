@@ -72,7 +72,7 @@ def is_prompt_done(prompt: RolloutPrompt) -> bool:
     # this is intentional — the worker clears the list after postprocessing,
     # so an empty list means "fully done, already postprocessed".
     return not any(
-        output.extra_fields.get("stop_reason") == "aborted" for output in prompt.agent_loop_output_list
+        output.extra_fields["stop_reason"] == "aborted" for output in prompt.agent_loop_output_list
     )
 
 
@@ -133,8 +133,13 @@ class RolloutPromptManager:
         num_prompts = batch.batch.size(0)
         # gen_batch is split row-wise in lockstep with batch; mismatched row
         # counts would silently mis-pair prompts with their generation inputs.
-        assert gen_batch.batch.size(0) == num_prompts, (
-            f"gen_batch row count {gen_batch.batch.size(0)} != batch row count {num_prompts}"
+        # Read from non_tensor_batch["uid"]: upstream `_get_gen_batch` doesn't pop
+        # any tensor keys (designed for agent-loop, which only consumes
+        # non_tensor_batch), so `gen_batch.batch` is None — but uid is always
+        # carried over via the reward_keys union.
+        gen_num_prompts = len(gen_batch.non_tensor_batch["uid"])
+        assert gen_num_prompts == num_prompts, (
+            f"gen_batch row count {gen_num_prompts} != batch row count {num_prompts}"
         )
         batch_list = batch.chunk(num_prompts)
         gen_batch_list = gen_batch.chunk(num_prompts)

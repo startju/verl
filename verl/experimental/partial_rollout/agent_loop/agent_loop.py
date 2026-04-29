@@ -22,6 +22,11 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
+# Import for side-effect: PRv3SingleTurnAgentLoop's @register("prv3_single_turn_agent")
+# only fires when this module is imported. Workers load agent_loop.py to construct
+# PRv3AgentLoopWorker; piggy-backing on that import path ensures the agent loop name
+# is in `_agent_loop_registry` before any worker's run_generate_sequences runs.
+import verl.experimental.partial_rollout.agent_loop.single_turn_agent_loop  # noqa: F401
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
@@ -65,29 +70,62 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         self.prompt_manager_handle = prompt_manager_handle
 
     async def run_generate_sequences(self, max_inflight_prompts: int, global_steps: int):
+        import os
+        wpid = os.getpid()
+        print(f"[WORKER-DBG pid={wpid}] run_generate_sequences enter, max_inflight={max_inflight_prompts}, global_steps={global_steps}", flush=True)
         rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
             max_inflight_prompts
         )
+        print(f"[WORKER-DBG pid={wpid}] pulled {len(rollout_prompts)} prompts", flush=True)
 
         running_set: set[asyncio.Task] = {
             asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in rollout_prompts
         }
+        print(f"[WORKER-DBG pid={wpid}] running_set has {len(running_set)} tasks", flush=True)
 
         is_canceled = False
+        loop_iter = 0
         while running_set:
             done, _ = await asyncio.wait(running_set, return_when=asyncio.FIRST_COMPLETED)
+            loop_iter += 1
+            print(f"[WORKER-DBG pid={wpid}] iter {loop_iter}: {len(done)} task(s) done", flush=True)
+            stop_reason_counts: dict = {}
+            exc_counts: dict = {}
+            done_count = 0
             for task in done:
                 running_set.remove(task)
-                rollout_prompt = task.result()
+                try:
+                    rollout_prompt = task.result()
+                except BaseException as e:
+                    import traceback
+                    exc_name = f"{type(e).__module__}.{type(e).__name__}: {e!s}"[:200]
+                    exc_counts[exc_name] = exc_counts.get(exc_name, 0) + 1
+                    if sum(exc_counts.values()) == 1:
+                        # Print full traceback for the first exception only
+                        print(f"[WORKER-DBG pid={wpid}] FIRST_EXC traceback:\n{traceback.format_exc()}", flush=True)
+                    continue
+                # Inspect first AgentLoopOutput stop_reason for diagnosis
+                try:
+                    first_out = rollout_prompt.agent_loop_output_list[0]
+                    sr = first_out.extra_fields.get("stop_reason", "<missing>")
+                except Exception as e:
+                    sr = f"<err:{type(e).__name__}>"
+                stop_reason_counts[sr] = stop_reason_counts.get(sr, 0) + 1
                 self.prompt_manager_handle.push_prompts.remote([rollout_prompt])
-                if not is_prompt_done(rollout_prompt):
+                pd = is_prompt_done(rollout_prompt)
+                if pd:
+                    done_count += 1
+                if not pd:
                     is_canceled = True
+            print(f"[WORKER-DBG pid={wpid}] iter {loop_iter}: stop_reasons={stop_reason_counts}, exc_counts={exc_counts}, done_via_is_prompt_done={done_count}/{len(done)}", flush=True)
             if is_canceled:
                 continue
             new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(len(done))
+            print(f"[WORKER-DBG pid={wpid}] pulled {len(new_rollout_prompts)} more prompts", flush=True)
             running_set.update(
                 asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in new_rollout_prompts
             )
+        print(f"[WORKER-DBG pid={wpid}] run_generate_sequences EXIT", flush=True)
 
     # copy from AgentLoopWorker generate_sequences
     async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt, global_steps: int) -> RolloutPrompt:
@@ -185,7 +223,7 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             rollout_prompt.agent_loop_output_list[i].extra_fields["min_global_steps"] = min_global_steps[i]
             if max_global_steps[i] is not None:
                 rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = max_global_steps[i]
-            elif rollout_prompt.agent_loop_output_list[i].stop_reason != "aborted":
+            elif rollout_prompt.agent_loop_output_list[i].extra_fields["stop_reason"] != "aborted":
                 rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = global_steps
 
         if is_prompt_done(rollout_prompt):
@@ -337,7 +375,10 @@ class PRv3AgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
+        print(f"[PRv3-DBG] gen_seq enter, replicas={len(self.rollout_replicas)}, workers={len(self.agent_loop_workers)}", flush=True)
+        print("[PRv3-DBG] resume BEGIN", flush=True)
         await self.resume()
+        print("[PRv3-DBG] resume END", flush=True)
         if prompts.meta_info.get("validate", False):
             return await super().generate_sequences(prompts)
 
@@ -346,27 +387,41 @@ class PRv3AgentLoopManager(AgentLoopManager):
         )
         global_steps = prompts.meta_info["global_steps"]
 
-        num_rollout_prompts = prompts.batch.size(0) // self.config.actor_rollout_ref.rollout.n
+        # prompts.batch is None: upstream `_get_gen_batch` doesn't pop tensor keys
+        # (agent-loop only consumes non_tensor_batch), so derive row count from uid,
+        # which repeat() carries through verbatim. After repeat-by-n, the uid array
+        # has len = n * num_rollout_prompts.
+        num_rollout_prompts = len(prompts.non_tensor_batch["uid"]) // self.config.actor_rollout_ref.rollout.n
 
         max_inflight_prompts = (num_rollout_prompts + len(self.agent_loop_workers) - 1) // len(self.agent_loop_workers)
+        print(f"[PRv3-DBG] dispatching {len(self.agent_loop_workers)} workers, max_inflight_prompts={max_inflight_prompts}, num_rollout_prompts={num_rollout_prompts}", flush=True)
         worker_tasks = [
             worker.run_generate_sequences.remote(max_inflight_prompts, global_steps)
             for worker in self.agent_loop_workers
         ]
+        print(f"[PRv3-DBG] dispatched, worker_tasks={len(worker_tasks)}", flush=True)
 
+        poll_count = 0
         while True:
             output = await self.rollout_prompt_manager.pull_batch.remote()
             if output:
+                print(f"[PRv3-DBG] pull_batch got output after {poll_count} polls", flush=True)
                 break
+            poll_count += 1
+            if poll_count % 500 == 1:  # ~5s cadence
+                print(f"[PRv3-DBG] pull_batch still None after {poll_count} polls", flush=True)
             await asyncio.sleep(0.01)
+        print("[PRv3-DBG] cancel BEGIN", flush=True)
         await self.cancel()
+        print("[PRv3-DBG] cancel END, gather worker_tasks", flush=True)
         await asyncio.gather(*worker_tasks)
+        print("[PRv3-DBG] gather DONE", flush=True)
 
         # calculate performance metrics
-        outputs = [output]
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        #outputs = [output]
+        #metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        #timing = self._performance_metrics(metrics, output)
+        #output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
     async def cancel(self):
