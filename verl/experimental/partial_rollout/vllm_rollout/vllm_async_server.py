@@ -67,7 +67,18 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
     ) -> TokenOutput:
         async with self.lock:
             if self.paused:
-                return TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"stop_reason": "aborted"})
+                # Carry global_steps even on abort so downstream `_postprocess`
+                # produces a consistent non_tensor_batch schema across prompts.
+                # Without this, prompts whose first generation aborts permanently
+                # lose `global_steps` (PRv3ToolAgentLoop's upstream
+                # _handle_generating_state only takes extra_fields wholesale on
+                # the first call), and DataProto.concat in pull_batch fails with
+                # "key global_steps length N != batch_size".
+                return TokenOutput(
+                    token_ids=[],
+                    stop_reason="aborted",
+                    extra_fields={"stop_reason": "aborted", "global_steps": self.global_steps},
+                )
             self.token_output_dict[request_id] = None
             self.cancel_event_dict[request_id] = asyncio.Event()
 
@@ -96,7 +107,18 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
 
         if token_output is None:
             await self.abort_request(request_id, True)
-            return TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"stop_reason": "aborted"})
+            # Carry global_steps even on abort so downstream `_postprocess`
+            # produces a consistent non_tensor_batch schema across prompts.
+            # Without this, prompts whose first generation aborts permanently
+            # lose `global_steps` (PRv3ToolAgentLoop's upstream
+            # _handle_generating_state only takes extra_fields wholesale on
+            # the first call), and DataProto.concat in pull_batch fails with
+            # "key global_steps length N != batch_size".
+            return TokenOutput(
+                token_ids=[],
+                stop_reason="aborted",
+                extra_fields={"stop_reason": "aborted", "global_steps": self.global_steps},
+            )
         if token_output.stop_reason == "abort":
             token_output.stop_reason = "aborted"
         token_output.extra_fields["stop_reason"] = token_output.stop_reason
