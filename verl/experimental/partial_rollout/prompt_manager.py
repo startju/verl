@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import itertools
 from collections import deque
 from dataclasses import dataclass
@@ -121,6 +122,18 @@ class RolloutPromptManager:
         self.ongoing_set: set[str] = set()
         self.pending_queue: deque[RolloutPrompt] = deque()
         self.done_queue: deque[RolloutPrompt] = deque()
+        # Set when done_queue first reaches batch_size; cleared by pull_batch
+        # after it drains a batch and done_queue falls back below the threshold.
+        # Lets pull_batch await readiness instead of being polled, eliminating
+        # the per-step ~10k empty Ray RPCs the manager used to fire while
+        # waiting on the first batch's tail end.
+        self._batch_ready: asyncio.Event = asyncio.Event()
+
+    def _maybe_signal_batch_ready(self) -> None:
+        # Single edge for any push that may have grown done_queue to threshold.
+        # asyncio.Event.set() is idempotent — fine to call when already set.
+        if len(self.done_queue) >= self.batch_size:
+            self._batch_ready.set()
 
     def push_batch(self, batch: DataProto, gen_batch: DataProto) -> bool:
         """Enqueue a trainer-supplied batch into pending_queue.
@@ -196,6 +209,11 @@ class RolloutPromptManager:
                     ],
                 )
             )
+        # Push paths only grow done_queue indirectly (via push_prompts when an
+        # in-flight prompt finishes), but signal here too so a freshly-pushed
+        # batch that lands sentinels straight into done — should that ever
+        # happen — wakes a waiting pull_batch.
+        self._maybe_signal_batch_ready()
         # Backpressure: count total in-flight (pending + ongoing + done), not
         # just pending. Otherwise a fast worker / slow trainer pattern keeps
         # pending empty while done_queue grows unbounded.
@@ -208,10 +226,15 @@ class RolloutPromptManager:
         in_flight = len(self.pending_queue) + len(self.ongoing_set) + len(self.done_queue)
         return in_flight < _PREFETCH_FACTOR * self.batch_size
 
-    def pull_batch(self) -> DataProto | None:
-        """Assemble one training batch from done_queue, or return None if not enough done yet."""
-        if len(self.done_queue) < self.batch_size:
-            return None
+    async def pull_batch(self) -> DataProto:
+        """Assemble one training batch once done_queue has accumulated batch_size prompts.
+
+        Awaits self._batch_ready instead of returning None on under-fill, so the
+        manager-side caller can `await pull_batch.remote()` once and resume
+        immediately on readiness — no manager-side polling, no per-step
+        thousands of empty Ray RPCs.
+        """
+        await self._batch_ready.wait()
         # Peek-then-commit: assemble can OOM during repeat/union/cat. If we
         # popleft up front and then fail, the prompts are lost; the caller
         # has no way to retry. Instead build the result first, only mutate
@@ -234,6 +257,10 @@ class RolloutPromptManager:
         )
         for _ in range(self.batch_size):
             self.done_queue.popleft()
+        # Re-arm the gate: if push_prompts hasn't yet topped done_queue back up
+        # to batch_size, the next pull_batch must block again.
+        if len(self.done_queue) < self.batch_size:
+            self._batch_ready.clear()
         return result
 
     def pull_prompts(self, max_count: int) -> list[RolloutPrompt]:
@@ -292,3 +319,7 @@ class RolloutPromptManager:
                 # grow, switch to extendleft(reversed(aborted_subset)) to
                 # preserve order — or decide that the reversal is fine.
                 self.pending_queue.appendleft(prompt)
+        # Wake any pull_batch waiter if this push pushed done_queue over the
+        # threshold. Hot path for throughput — without this, pull_batch would
+        # block on _batch_ready forever even after the batch is ready.
+        self._maybe_signal_batch_ready()

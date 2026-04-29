@@ -419,16 +419,11 @@ class PRv3AgentLoopManager(AgentLoopManager):
         ]
         print(f"[PRv3-DBG] dispatched, worker_tasks={len(worker_tasks)}", flush=True)
 
-        poll_count = 0
-        while True:
-            output = await self.rollout_prompt_manager.pull_batch.remote()
-            if output:
-                print(f"[PRv3-DBG] pull_batch got output after {poll_count} polls", flush=True)
-                break
-            poll_count += 1
-            if poll_count % 500 == 1:  # ~5s cadence
-                print(f"[PRv3-DBG] pull_batch still None after {poll_count} polls", flush=True)
-            await asyncio.sleep(0.01)
+        # pull_batch is now async server-side and blocks on an internal
+        # asyncio.Event until done_queue >= batch_size. One round-trip, no
+        # manager-side polling, no per-step ~10k empty Ray RPCs.
+        output = await self.rollout_prompt_manager.pull_batch.remote()
+        print("[PRv3-DBG] pull_batch got output", flush=True)
         print("[PRv3-DBG] cancel BEGIN", flush=True)
         await self.cancel()
         print("[PRv3-DBG] cancel END, gather worker_tasks", flush=True)
