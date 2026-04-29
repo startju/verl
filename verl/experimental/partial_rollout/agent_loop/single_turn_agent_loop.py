@@ -28,6 +28,22 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         last_agent_loop_output: AgentLoopOutput = kwargs.get("last_agent_loop_output")
 
+        # PRv3's training dispatch (run_generate_sequences →
+        # _generate_sequences_for_prompt) always injects last_agent_loop_output
+        # in kwargs. The only path that omits it is upstream AgentLoopWorker
+        # .generate_sequences, which PRv3AgentLoopManager.generate_sequences
+        # delegates to when prompts.meta_info["validate"] is True. Both PRv3
+        # dispatch paths set kwargs["validate"] from trajectory["validate"]
+        # (PRv3AgentLoopWorker._run_agent_loop / _run_agent_loop_no_post) so
+        # we can sanity-check that last=None only happens on the validate
+        # path; outside that, treat it as a contract violation and surface it.
+        if last_agent_loop_output is None:
+            assert kwargs.get("_prv3_is_validate") is True, (
+                "last_agent_loop_output=None outside validate path "
+                f"(kwargs.get('_prv3_is_validate')={kwargs.get('_prv3_is_validate')!r})"
+            )
+            return await super().run(sampling_params, **kwargs)
+
         metrics = {}
         if not last_agent_loop_output.prompt_ids:
             messages = list(kwargs["raw_prompt"])

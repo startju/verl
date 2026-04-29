@@ -70,6 +70,19 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         )
         self.prompt_manager_handle = prompt_manager_handle
 
+    async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        # Inject validate flag from per-sample trajectory dict so PRv3 agent
+        # loop subclasses can detect the validate path directly via kwargs
+        # rather than inferring it from sampling_params overrides.
+        # Key name avoids "validate" to prevent collision with upstream
+        # AgentLoopWorker._agent_loop_postprocess(self, output, validate, **kwargs),
+        # which takes `validate` as a positional and would TypeError on a duplicate
+        # via **kwargs.
+        kwargs["_prv3_is_validate"] = trajectory["validate"]
+        return await super()._run_agent_loop(
+            sampling_params, trajectory, agent_name=agent_name, trace=trace, **kwargs
+        )
+
     async def run_generate_sequences(self, max_inflight_prompts: int, global_steps: int):
         import os
         wpid = os.getpid()
@@ -281,6 +294,10 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
+            # Symmetric with PRv3AgentLoopWorker._run_agent_loop: inject the
+            # validate flag so every PRv3 agent_loop.run() call receives the
+            # same kwargs shape regardless of dispatch path (train vs validate).
+            kwargs["_prv3_is_validate"] = trajectory["validate"]
             return await agent_loop.run(sampling_params, **kwargs)
 
 
