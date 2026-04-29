@@ -26,6 +26,8 @@ python3 -m verl.experimental.partial_rollout.main_ppo \
     data.max_response_length=512 \
     algorithm.adv_estimator=grpo \
     algorithm.kl_ctrl.kl_coef=0.001 \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold=2.0 \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
