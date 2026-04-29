@@ -176,6 +176,11 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
+        # Number of batches already consumed in current_epoch before the
+        # checkpoint was taken. On resume the stateful dataloader yields only
+        # `len - start_in_epoch` batches for the current epoch, so the inner
+        # loop below caps at that count for the resumed epoch.
+        start_in_epoch = self.global_steps % len(self.train_dataloader)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -209,13 +214,17 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             # Pass the iterator (not a batch_dict) so _fit_generate can consume
-            # multiple items per step under backpressure. Cap inner iterations
-            # at len(self.train_dataloader) so epochs advance and the loop
-            # can't deadlock after data_loader_iter and rollout_prompt_manager
-            # both drain.
+            # multiple items per step under backpressure. Assumes a stateful
+            # dataloader: on resume, iter(self.train_dataloader) yields only
+            # the remaining batches in the current epoch, so no manual skip
+            # is needed — but the inner loop must also cap at the matching
+            # remaining count, otherwise the leftover iterations fall into
+            # the dummy gen_batch path and burn step counts. Subsequent
+            # epochs (epoch != current_epoch) run a full pass.
             self.epoch = epoch
             data_loader_iter = iter(self.train_dataloader)
-            for _ in range(len(self.train_dataloader)):
+            start = start_in_epoch if epoch == current_epoch else 0
+            for _ in range(start, len(self.train_dataloader)):
                 self.fit_step(data_loader_iter)
                 if self.is_last_step:
                     return
