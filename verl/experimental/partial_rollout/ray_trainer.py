@@ -99,8 +99,12 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
                 # global_steps is required by PRv3 generate_sequences (asserted
                 # in agent_loop.py); the rest of meta_info is unused here since
                 # generate_sequences pulls real batches from rollout_prompt_manager.
+                # Source the batch_size from config (matches RolloutPromptManager)
+                # rather than self.train_dataloader.batch_size, which is None when
+                # the DataLoader is built with a batch_sampler.
+                dummy_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
                 gen_batch = DataProto(
-                    batch=TensorDict({}, batch_size=(self.train_dataloader.batch_size,)),
+                    batch=TensorDict({}, batch_size=(dummy_batch_size,)),
                     meta_info={"global_steps": self.global_steps},
                 )
                 break
@@ -223,8 +227,8 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             # epochs (epoch != current_epoch) run a full pass.
             self.epoch = epoch
             data_loader_iter = iter(self.train_dataloader)
-            start = start_in_epoch if epoch == current_epoch else 0
-            for _ in range(start, len(self.train_dataloader)):
+            remaining = len(self.train_dataloader) - (start_in_epoch if epoch == current_epoch else 0)
+            for _ in range(remaining):
                 self.fit_step(data_loader_iter)
                 if self.is_last_step:
                     return
