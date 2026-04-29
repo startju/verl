@@ -22,11 +22,12 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
-# Import for side-effect: PRv3SingleTurnAgentLoop's @register("prv3_single_turn_agent")
-# only fires when this module is imported. Workers load agent_loop.py to construct
-# PRv3AgentLoopWorker; piggy-backing on that import path ensures the agent loop name
-# is in `_agent_loop_registry` before any worker's run_generate_sequences runs.
+# Import for side-effect: PRv3{SingleTurn,Tool}AgentLoop's @register(...) decorators
+# only fire when these modules are imported. Workers load agent_loop.py to construct
+# PRv3AgentLoopWorker; piggy-backing on that import path ensures the agent loop names
+# are in `_agent_loop_registry` before any worker's run_generate_sequences runs.
 import verl.experimental.partial_rollout.agent_loop.single_turn_agent_loop  # noqa: F401
+import verl.experimental.partial_rollout.agent_loop.tool_agent_loop  # noqa: F401
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
