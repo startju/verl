@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.utils.rollout_trace import rollout_trace_op
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Snapshot key in AgentLoopOutput.extra_fields holding the AgentData state
 # needed to resume a multi-turn rollout aborted mid-generation. Only fields not
@@ -31,30 +36,23 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         last_agent_loop_output: AgentLoopOutput = kwargs.get("last_agent_loop_output")
 
-        # Already-done rollout (terminated cleanly in a prior round): pass through.
-        # Mirrors PRv3SingleTurnAgentLoop's fast-exit; without it we'd re-run a
-        # full state machine over an already-terminated sample.
-        if (
-            last_agent_loop_output is not None
-            and last_agent_loop_output.prompt_ids
-            and last_agent_loop_output.extra_fields.get("stop_reason") != "aborted"
-        ):
-            return last_agent_loop_output
+        if last_agent_loop_output is None:
+            assert kwargs.get("_prv3_is_validate") is True, (
+                "last_agent_loop_output=None outside validate path "
+                f"(kwargs.get('_prv3_is_validate')={kwargs.get('_prv3_is_validate')!r})"
+            )
+            return await super().run(sampling_params, **kwargs)
 
-        is_resume = (
-            last_agent_loop_output is not None
-            and last_agent_loop_output.prompt_ids
-            and last_agent_loop_output.extra_fields.get("stop_reason") == "aborted"
-        )
-
-        if is_resume:
+        if not last_agent_loop_output.prompt_ids:
+            agent_data = await self._init_agent_data_fresh(**kwargs)
+            initial_state = AgentState.PENDING
+        else:
+            if last_agent_loop_output.extra_fields["stop_reason"] != "aborted":
+                return last_agent_loop_output
             agent_data = await self._restore_agent_data(last_agent_loop_output, **kwargs)
             # Prompt is already templated and conversation tokens are intact;
             # jump straight back into another generate call.
             initial_state = AgentState.GENERATING
-        else:
-            agent_data = await self._init_agent_data_fresh(**kwargs)
-            initial_state = AgentState.PENDING
 
         state = initial_state
         while state != AgentState.TERMINATED:
@@ -65,6 +63,7 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
             elif state == AgentState.PROCESSING_TOOLS:
                 state = await self._handle_processing_tools_state(agent_data)
             else:
+                logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
         output = self._build_output(agent_data)

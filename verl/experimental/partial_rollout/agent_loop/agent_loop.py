@@ -431,10 +431,10 @@ class PRv3AgentLoopManager(AgentLoopManager):
         print("[PRv3-DBG] gather DONE", flush=True)
 
         # calculate performance metrics
-        #outputs = [output]
-        #metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        #timing = self._performance_metrics(metrics, output)
-        #output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        # outputs = [output]
+        # metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        # timing = self._performance_metrics(metrics, output)
+        # output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
     async def cancel(self):
