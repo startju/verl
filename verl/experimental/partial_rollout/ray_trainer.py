@@ -10,9 +10,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import uuid
 from pprint import pprint
 from typing import Optional
 
+import numpy as np
 import ray
 import torch
 from omegaconf import open_dict
@@ -109,8 +111,18 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
                 # rather than self.train_dataloader.batch_size, which is None when
                 # the DataLoader is built with a batch_sampler.
                 dummy_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+                # Match the gen_batch contract: every row carries a uid in
+                # non_tensor_batch (PRv3AgentLoopManager.generate_sequences
+                # derives num_rollout_prompts from len(uid)). Use unique uuids
+                # so any leak into prompt_manager's UID-collision guard can't
+                # accidentally match a real in-flight prompt.
                 gen_batch = DataProto(
                     batch=TensorDict({}, batch_size=(dummy_batch_size,)),
+                    non_tensor_batch={
+                        "uid": np.array(
+                            [str(uuid.uuid4()) for _ in range(dummy_batch_size)], dtype=object
+                        ),
+                    },
                     meta_info={"global_steps": self.global_steps},
                 )
                 break
