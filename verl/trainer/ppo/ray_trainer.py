@@ -1318,6 +1318,12 @@ class RayPPOTrainer:
 
         # we start from step 1
         self.global_steps += 1
+        if self.global_steps > self.total_training_steps:
+            # Resumed from a checkpoint that already met or exceeded the
+            # configured limit; nothing left to do. Without this guard the loop
+            # below would unconditionally run one more step before checking
+            # is_last_step.
+            return
         last_val_metrics = None
         self.max_steps_duration = 0
 

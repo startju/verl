@@ -52,9 +52,7 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
 
         # for cancel LLMServer
         self.paused = False
-        self.lock = asyncio.Lock()
-        self.cancel_event_dict: dict[str, asyncio.Event] = {}
-        self.token_output_dict: dict[str, Optional[TokenOutput]] = {}
+        self.inflight = 0
 
     async def generate(
         self,
@@ -65,48 +63,7 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
-        async with self.lock:
-            if self.paused:
-                # Carry global_steps even on abort so downstream `_postprocess`
-                # produces a consistent non_tensor_batch schema across prompts.
-                # Without this, prompts whose first generation aborts permanently
-                # lose `global_steps` (PRv3ToolAgentLoop's upstream
-                # _handle_generating_state only takes extra_fields wholesale on
-                # the first call), and DataProto.concat in pull_batch fails with
-                # "key global_steps length N != batch_size".
-                return TokenOutput(
-                    token_ids=[],
-                    stop_reason="aborted",
-                    extra_fields={"stop_reason": "aborted", "global_steps": self.global_steps},
-                )
-            self.token_output_dict[request_id] = None
-            self.cancel_event_dict[request_id] = asyncio.Event()
-
-            async def _generate():
-                self.token_output_dict[request_id] = await vLLMHttpServer.generate(
-                    self, prompt_ids, sampling_params, request_id, image_data, video_data, priority
-                )
-
-            generate_handle = asyncio.create_task(_generate())
-            cancel_handle = asyncio.create_task(self.cancel_event_dict[request_id].wait())
-
-        try:
-            done, pend = await asyncio.wait([generate_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                await task
-            for task in pend:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        finally:
-            async with self.lock:
-                token_output = self.token_output_dict.pop(request_id, None)
-                self.cancel_event_dict.pop(request_id, None)
-
-        if token_output is None:
-            await self.abort_request(request_id, True)
+        if self.paused:
             # Carry global_steps even on abort so downstream `_postprocess`
             # produces a consistent non_tensor_batch schema across prompts.
             # Without this, prompts whose first generation aborts permanently
@@ -119,20 +76,37 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
                 stop_reason="aborted",
                 extra_fields={"stop_reason": "aborted", "global_steps": self.global_steps},
             )
+        self.inflight += 1
+        token_output = await vLLMHttpServer.generate(
+                    self, prompt_ids, sampling_params, request_id, image_data, video_data, priority
+                )
+        self.inflight -= 1
         if token_output.stop_reason == "abort":
             token_output.stop_reason = "aborted"
         token_output.extra_fields["stop_reason"] = token_output.stop_reason
         return token_output
 
     async def cancel(self):
-        async with self.lock:
-            self.paused = True
-            for cancel_event in self.cancel_event_dict.values():
-                cancel_event.set()
+        import os
+        import time
+        wpid = os.getpid()
+        t0 = time.perf_counter()
+        self.paused = True
+        n_inflight_start = self.inflight
+        drain_iters = 0
+        while self.inflight:
+            await self.abort_all_requests(reset_prefix_cache=False)
+            await asyncio.sleep(0)
+            drain_iters += 1
+        t1 = time.perf_counter()
+        print(
+            f"[CANCEL-DBG pid={wpid}] server.cancel "
+            f"total={t1 - t0:.3f}s n_inflight_start={n_inflight_start} drain_iters={drain_iters}",
+            flush=True,
+        )
 
     async def resume(self):
-        async with self.lock:
-            self.paused = False
+        self.paused = False
 
 
 class PRv3vLLMReplica(vLLMReplica):
@@ -153,7 +127,14 @@ class PRv3vLLMReplica(vLLMReplica):
 
     async def cancel(self):
         """Cancel each rollout server."""
+        import time
+        t0 = time.perf_counter()
         await asyncio.gather(*[server.cancel.remote() for server in self.servers])
+        t1 = time.perf_counter()
+        print(
+            f"[CANCEL-DBG] replica.cancel ray_total={t1 - t0:.3f}s n_servers={len(self.servers)}",
+            flush=True,
+        )
 
     async def resume(self):
         """Resume each rollout server."""

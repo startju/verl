@@ -93,9 +93,12 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         self.async_rollout_manager.init_agent_loop_workers(self.rollout_prompt_manager)
 
     def _fit_generate(self, data_loader_iter) -> DataProto:
+        import time as _time
         metrics = self.metrics
         timing_raw = self.timing_raw
 
+        _push_n = 0
+        _push_total_s = 0.0
         need_more = True
         while need_more:
             try:
@@ -130,15 +133,26 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             gen_batch = self._get_gen_batch(batch)
             # pass global_steps to trace
             gen_batch.meta_info["global_steps"] = self.global_steps
+            _t0 = _time.perf_counter()
             need_more = ray.get(self.rollout_prompt_manager.push_batch.remote(batch, gen_batch))
+            _push_total_s += _time.perf_counter() - _t0
+            _push_n += 1
 
         gen_batch_output = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+        print(
+            f"[PR-TRAINER-DBG] step push_batch.remote x{_push_n} total={_push_total_s:.3f}s "
+            f"avg={(_push_total_s / _push_n if _push_n else 0):.3f}s",
+            flush=True,
+        )
 
         with marked_timer("gen", timing_raw, color="red"):
             if self.curr_step_profile:
                 self.async_rollout_manager.start_profile(global_step=self.global_steps)
+            _t_gs0 = _time.perf_counter()
             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+            _t_gs1 = _time.perf_counter()
             self.checkpoint_manager.sleep_replicas()
+            _t_sr1 = _time.perf_counter()
             if self.curr_step_profile:
                 self.async_rollout_manager.stop_profile()
 
@@ -151,7 +165,15 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             if timing:
                 timing_raw.update(timing)
             self._collect_metrics_from_samples(gen_batch_output, metrics)
+            _t_cm1 = _time.perf_counter()
             print(f"[PRv3-DBG] temperature={gen_batch_output.meta_info['temperature']}", flush=True)
+            print(
+                f"[PR-TRAINER-DBG] step gen_breakdown "
+                f"generate_sequences={_t_gs1 - _t_gs0:.3f}s "
+                f"sleep_replicas={_t_sr1 - _t_gs1:.3f}s "
+                f"collect_metrics={_t_cm1 - _t_sr1:.3f}s",
+                flush=True,
+            )
 
         # gen_batch_output already carries the repeated/unioned batch built by
         # the agent loop, so use it directly instead of repeating + unioning here.
@@ -249,6 +271,12 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
+        if self.global_steps > self.total_training_steps:
+            # Resumed from a checkpoint that already met or exceeded the
+            # configured limit; nothing left to do. Without this guard the loop
+            # below would unconditionally run one more step before checking
+            # is_last_step.
+            return
         self.last_val_metrics = None
         self.max_steps_duration = 0
 

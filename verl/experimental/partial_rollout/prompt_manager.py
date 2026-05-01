@@ -128,6 +128,25 @@ class RolloutPromptManager:
         # the per-step ~10k empty Ray RPCs the manager used to fire while
         # waiting on the first batch's tail end.
         self._batch_ready: asyncio.Event = asyncio.Event()
+        # Per-step aggregate timings (reset at pull_batch). Lets us localize the
+        # +10s/step PR-vs-baseline overhead to a specific stage. All times in s.
+        self._dbg = {
+            "push_batch_n": 0,
+            "push_batch_s": 0.0,
+            "push_batch_inflight_s": 0.0,
+            "push_batch_chunk_s": 0.0,
+            "push_batch_append_s": 0.0,
+            "push_prompts_n": 0,
+            "push_prompts_s": 0.0,
+            "push_prompts_max_s": 0.0,
+            "pull_prompts_n": 0,
+            "pull_prompts_s": 0.0,
+            "pull_prompts_max_s": 0.0,
+        }
+
+    def _dbg_reset(self) -> None:
+        for k in self._dbg:
+            self._dbg[k] = 0 if isinstance(self._dbg[k], int) else 0.0
 
     def _maybe_signal_batch_ready(self) -> None:
         # Single edge for any push that may have grown done_queue to threshold.
@@ -143,6 +162,8 @@ class RolloutPromptManager:
         trainer uses this as a backpressure signal to decide whether to keep
         feeding.
         """
+        import time as _time
+        _t_start = _time.perf_counter()
         num_prompts = batch.batch.size(0)
         # gen_batch is split row-wise in lockstep with batch; mismatched row
         # counts would silently mis-pair prompts with their generation inputs.
@@ -154,17 +175,21 @@ class RolloutPromptManager:
         assert gen_num_prompts == num_prompts, (
             f"gen_batch row count {gen_num_prompts} != batch row count {num_prompts}"
         )
+        _t_chunk0 = _time.perf_counter()
         batch_list = batch.chunk(num_prompts)
         gen_batch_list = gen_batch.chunk(num_prompts)
+        _t_chunk1 = _time.perf_counter()
         n = self.n
 
         # Validate all UIDs first, then mutate. This makes push_batch atomic:
         # if any UID collides (with another in-flight prompt or a duplicate
         # within this same batch) the assert fires before any state changes,
         # so the actor is left in a clean state for the caller to react to.
+        _t_inflight0 = _time.perf_counter()
         in_flight_ids = (
             self.ongoing_set | {p.prompt_id for p in self.pending_queue} | {p.prompt_id for p in self.done_queue}
         )
+        _t_inflight1 = _time.perf_counter()
         # Element type is whatever non_tensor_batch["uid"] holds — usually
         # numpy.str_ (a str subclass), occasionally a python str depending on
         # how the upstream dataset built the column. Annotated as Any to avoid
@@ -180,6 +205,7 @@ class RolloutPromptManager:
             in_flight_ids.add(prompt_id)
             prompt_ids.append(prompt_id)
 
+        _t_append0 = _time.perf_counter()
         for i in range(num_prompts):
             prompt_batch = batch_list[i]
             prompt_gen_batch = gen_batch_list[i]
@@ -224,6 +250,12 @@ class RolloutPromptManager:
         # expected, not a starvation bug. Don't "fix" it by reverting to a
         # pending-only check without addressing the OOM risk.
         in_flight = len(self.pending_queue) + len(self.ongoing_set) + len(self.done_queue)
+        _t_end = _time.perf_counter()
+        self._dbg["push_batch_n"] += 1
+        self._dbg["push_batch_s"] += _t_end - _t_start
+        self._dbg["push_batch_inflight_s"] += _t_inflight1 - _t_inflight0
+        self._dbg["push_batch_chunk_s"] += _t_chunk1 - _t_chunk0
+        self._dbg["push_batch_append_s"] += _t_end - _t_append0
         return in_flight < _PREFETCH_FACTOR * self.batch_size
 
     async def pull_batch(self) -> DataProto:
@@ -270,10 +302,26 @@ class RolloutPromptManager:
         # to batch_size, the next pull_batch must block again.
         if len(self.done_queue) < self.batch_size:
             self._batch_ready.clear()
+        d = self._dbg
+        print(
+            f"[PRMGR-DBG] step "
+            f"push_batch n={d['push_batch_n']} total={d['push_batch_s']:.3f}s "
+            f"(inflight={d['push_batch_inflight_s']:.3f}s "
+            f"chunk={d['push_batch_chunk_s']:.3f}s "
+            f"append={d['push_batch_append_s']:.3f}s) | "
+            f"push_prompts n={d['push_prompts_n']} total={d['push_prompts_s']:.3f}s "
+            f"max={d['push_prompts_max_s']:.4f}s | "
+            f"pull_prompts n={d['pull_prompts_n']} total={d['pull_prompts_s']:.3f}s "
+            f"max={d['pull_prompts_max_s']:.4f}s",
+            flush=True,
+        )
+        self._dbg_reset()
         return result
 
     def pull_prompts(self, max_count: int) -> list[RolloutPrompt]:
         """Hand at most max_count prompts to a worker; moves them pending → ongoing."""
+        import time as _time
+        _t0 = _time.perf_counter()
         take = min(max_count, len(self.pending_queue))
         # Validate first, then mutate — same atomicity discipline as push_batch
         # / push_prompts. Belt-and-braces: by construction (push_batch UID
@@ -289,10 +337,17 @@ class RolloutPromptManager:
 
         pending_prompts = [self.pending_queue.popleft() for _ in range(take)]
         self.ongoing_set.update(p.prompt_id for p in pending_prompts)
+        _dt = _time.perf_counter() - _t0
+        self._dbg["pull_prompts_n"] += 1
+        self._dbg["pull_prompts_s"] += _dt
+        if _dt > self._dbg["pull_prompts_max_s"]:
+            self._dbg["pull_prompts_max_s"] = _dt
         return pending_prompts
 
     def push_prompts(self, prompts: list[RolloutPrompt]) -> None:
         """Return prompts from a worker; routes done ones to done_queue, aborted ones back to pending."""
+        import time as _time
+        _t0 = _time.perf_counter()
         # Validate first, then mutate — same atomicity discipline as push_batch.
         # Catches both "prompt was never pulled" and "same prompt pushed twice
         # in this call" before any state changes. is_prompt_done is computed
@@ -329,3 +384,8 @@ class RolloutPromptManager:
         # threshold. Hot path for throughput — without this, pull_batch would
         # block on _batch_ready forever even after the batch is ready.
         self._maybe_signal_batch_ready()
+        _dt = _time.perf_counter() - _t0
+        self._dbg["push_prompts_n"] += 1
+        self._dbg["push_prompts_s"] += _dt
+        if _dt > self._dbg["push_prompts_max_s"]:
+            self._dbg["push_prompts_max_s"] = _dt
