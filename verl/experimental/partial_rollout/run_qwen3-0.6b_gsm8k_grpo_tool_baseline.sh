@@ -6,7 +6,8 @@ set -xeo pipefail
 # variant of the tool script:
 #   - python -m verl.trainer.main_ppo (upstream entry, not PRv3)
 #   - default_agent_loop=tool_agent (upstream loop, not prv3_tool_agent)
-#   - no algorithm.rollout_correction.rollout_is overrides
+#   - same algorithm.rollout_correction.rollout_is settings as the PR variant
+#     (baseline is on-policy → ratios ~1, but keeps the loss code path identical)
 # Same multi-turn / tool config as the PR variant so A/B is apples-to-apples.
 #
 # Dataset note: generate the multi-turn-with-tool dataset before running:
@@ -46,6 +47,8 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold="0.5_2.0" \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \

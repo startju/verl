@@ -6,8 +6,9 @@ set -xeo pipefail
 # differences are:
 #   - python -m verl.trainer.main_ppo (upstream entry, not PRv3)
 #   - default_agent_loop=single_turn_agent (upstream loop, not prv3_*)
-#   - no algorithm.rollout_correction.rollout_is overrides (IS correction is
-#     only meaningful when rollouts span weight versions; baseline is on-policy)
+#   - same algorithm.rollout_correction.rollout_is settings as the PR variant
+#     so the loss path is apples-to-apples (baseline is on-policy so IS ratios
+#     are ~1, but keep the code path identical for cleaner A/B)
 # Use this for A/B against the partial-rollout run on the same wall clock.
 
 export NCCL_P2P_DISABLE=1
@@ -36,6 +37,8 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=1024 \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold="0.5_2.0" \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
