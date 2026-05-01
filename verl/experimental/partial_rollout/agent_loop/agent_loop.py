@@ -36,7 +36,12 @@ from verl.experimental.agent_loop.agent_loop import (
     _agent_loop_registry,
     get_trajectory_info,
 )
-from verl.experimental.partial_rollout.prompt_manager import RolloutPrompt, RolloutPromptManager, is_prompt_done
+from verl.experimental.partial_rollout.prompt_manager import (
+    RolloutPrompt,
+    RolloutPromptManager,
+    get_unfinished_traj_count,
+    is_prompt_done,
+)
 from verl.experimental.partial_rollout.vllm_rollout.vllm_async_server import PRv3vLLMReplica
 from verl.experimental.teacher_loop.teacher_model import MultiTeacherModelManager
 from verl.protocol import DataProto
@@ -69,6 +74,10 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             reward_loop_worker_handles,
         )
         self.prompt_manager_handle = prompt_manager_handle
+        # Cache rollout.n locally so run_generate_sequences can size pull_prompts
+        # by trajectory budget (max_inflight_prompts is in prompt units; pull_prompts
+        # now takes a sub-prompt/traj count).
+        self.n = config.actor_rollout_ref.rollout.n
 
     async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
         # Inject validate flag from per-sample trajectory dict so PRv3 agent
@@ -79,73 +88,48 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         # which takes `validate` as a positional and would TypeError on a duplicate
         # via **kwargs.
         kwargs["_prv3_is_validate"] = trajectory["validate"]
-        return await super()._run_agent_loop(
-            sampling_params, trajectory, agent_name=agent_name, trace=trace, **kwargs
-        )
+        return await super()._run_agent_loop(sampling_params, trajectory, agent_name=agent_name, trace=trace, **kwargs)
 
     async def run_generate_sequences(self, max_inflight_prompts: int, global_steps: int):
-        import os
-        wpid = os.getpid()
-        print(f"[WORKER-DBG pid={wpid}] run_generate_sequences enter, max_inflight={max_inflight_prompts}, global_steps={global_steps}", flush=True)
         rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
-            max_inflight_prompts
+            max_inflight_prompts * self.n
         )
-        print(f"[WORKER-DBG pid={wpid}] pulled {len(rollout_prompts)} prompts", flush=True)
 
-        running_set: set[asyncio.Task] = {
-            asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in rollout_prompts
+        # Map task -> unfinished traj count consumed when this rp was pulled.
+        # Refilling the pull budget after a prompt completes uses the *recorded*
+        # count, not n: a partial prompt only consumed (and frees) its remaining
+        # aborted-traj count, not the full n.
+        running_tasks: dict[asyncio.Task, int] = {
+            asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)): get_unfinished_traj_count(rp)
+            for rp in rollout_prompts
         }
-        print(f"[WORKER-DBG pid={wpid}] running_set has {len(running_set)} tasks", flush=True)
 
         is_canceled = False
-        loop_iter = 0
-        while running_set:
-            done, _ = await asyncio.wait(running_set, return_when=asyncio.FIRST_COMPLETED)
-            loop_iter += 1
-            print(f"[WORKER-DBG pid={wpid}] iter {loop_iter}: {len(done)} task(s) done", flush=True)
-            stop_reason_counts: dict = {}
-            exc_counts: dict = {}
-            done_count = 0
+        while running_tasks:
+            done, _ = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
             # Batch all completed prompts into a single push_prompts.remote() call
             # to amortize Ray actor RPC overhead. push_prompts already accepts
             # mixed done/aborted lists (prompt_manager.py:285-321).
             prompts_to_push: list[RolloutPrompt] = []
+            freed_traj = 0
             for task in done:
-                running_set.remove(task)
-                try:
-                    rollout_prompt = task.result()
-                except BaseException as e:
-                    import traceback
-                    exc_name = f"{type(e).__module__}.{type(e).__name__}: {e!s}"[:200]
-                    exc_counts[exc_name] = exc_counts.get(exc_name, 0) + 1
-                    if sum(exc_counts.values()) == 1:
-                        # Print full traceback for the first exception only
-                        print(f"[WORKER-DBG pid={wpid}] FIRST_EXC traceback:\n{traceback.format_exc()}", flush=True)
-                    continue
-                # Inspect first AgentLoopOutput stop_reason for diagnosis
-                try:
-                    first_out = rollout_prompt.agent_loop_output_list[0]
-                    sr = first_out.extra_fields.get("stop_reason", "<missing>")
-                except Exception as e:
-                    sr = f"<err:{type(e).__name__}>"
-                stop_reason_counts[sr] = stop_reason_counts.get(sr, 0) + 1
+                consumed_traj = running_tasks.pop(task)
+                rollout_prompt = task.result()
                 prompts_to_push.append(rollout_prompt)
-                pd = is_prompt_done(rollout_prompt)
-                if pd:
-                    done_count += 1
-                if not pd:
+                if not is_prompt_done(rollout_prompt):
                     is_canceled = True
+                else:
+                    freed_traj += consumed_traj
             if prompts_to_push:
                 self.prompt_manager_handle.push_prompts.remote(prompts_to_push)
-            print(f"[WORKER-DBG pid={wpid}] iter {loop_iter}: stop_reasons={stop_reason_counts}, exc_counts={exc_counts}, done_via_is_prompt_done={done_count}/{len(done)}", flush=True)
             if is_canceled:
                 continue
-            new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(len(done))
-            print(f"[WORKER-DBG pid={wpid}] pulled {len(new_rollout_prompts)} more prompts", flush=True)
-            running_set.update(
-                asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)) for rp in new_rollout_prompts
+            new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
+                freed_traj
             )
-        print(f"[WORKER-DBG pid={wpid}] run_generate_sequences EXIT", flush=True)
+            for rp in new_rollout_prompts:
+                task = asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps))
+                running_tasks[task] = get_unfinished_traj_count(rp)
 
     # copy from AgentLoopWorker generate_sequences
     async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt, global_steps: int) -> RolloutPrompt:
@@ -399,10 +383,7 @@ class PRv3AgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
-        print(f"[PRv3-DBG] gen_seq enter, replicas={len(self.rollout_replicas)}, workers={len(self.agent_loop_workers)}", flush=True)
-        print("[PRv3-DBG] resume BEGIN", flush=True)
         await self.resume()
-        print("[PRv3-DBG] resume END", flush=True)
         if prompts.meta_info.get("validate", False):
             return await super().generate_sequences(prompts)
 
@@ -418,30 +399,17 @@ class PRv3AgentLoopManager(AgentLoopManager):
         num_rollout_prompts = len(prompts.non_tensor_batch["uid"]) // self.config.actor_rollout_ref.rollout.n
 
         max_inflight_prompts = (num_rollout_prompts + len(self.agent_loop_workers) - 1) // len(self.agent_loop_workers)
-        print(f"[PRv3-DBG] dispatching {len(self.agent_loop_workers)} workers, max_inflight_prompts={max_inflight_prompts}, num_rollout_prompts={num_rollout_prompts}", flush=True)
         worker_tasks = [
             worker.run_generate_sequences.remote(max_inflight_prompts, global_steps)
             for worker in self.agent_loop_workers
         ]
-        print(f"[PRv3-DBG] dispatched, worker_tasks={len(worker_tasks)}", flush=True)
 
         # pull_batch is now async server-side and blocks on an internal
         # asyncio.Event until done_queue >= batch_size. One round-trip, no
         # manager-side polling, no per-step ~10k empty Ray RPCs.
-        import time
-        t_pull0 = time.perf_counter()
         output = await self.rollout_prompt_manager.pull_batch.remote()
-        t_pull1 = time.perf_counter()
         await self.cancel()
-        t_cancel1 = time.perf_counter()
         await asyncio.gather(*worker_tasks)
-        t_gather1 = time.perf_counter()
-        print(
-            f"[PRv3-DBG] pull_batch={t_pull1 - t_pull0:.2f}s "
-            f"cancel={t_cancel1 - t_pull1:.2f}s "
-            f"gather={t_gather1 - t_cancel1:.2f}s",
-            flush=True,
-        )
 
         # calculate performance metrics
         # outputs = [output]

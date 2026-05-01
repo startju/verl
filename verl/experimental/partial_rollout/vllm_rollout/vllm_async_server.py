@@ -87,23 +87,10 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
         return token_output
 
     async def cancel(self):
-        import os
-        import time
-        wpid = os.getpid()
-        t0 = time.perf_counter()
         self.paused = True
-        n_inflight_start = self.inflight
-        drain_iters = 0
         while self.inflight:
             await self.abort_all_requests(reset_prefix_cache=False)
             await asyncio.sleep(0)
-            drain_iters += 1
-        t1 = time.perf_counter()
-        print(
-            f"[CANCEL-DBG pid={wpid}] server.cancel "
-            f"total={t1 - t0:.3f}s n_inflight_start={n_inflight_start} drain_iters={drain_iters}",
-            flush=True,
-        )
 
     async def resume(self):
         self.paused = False
@@ -127,14 +114,7 @@ class PRv3vLLMReplica(vLLMReplica):
 
     async def cancel(self):
         """Cancel each rollout server."""
-        import time
-        t0 = time.perf_counter()
         await asyncio.gather(*[server.cancel.remote() for server in self.servers])
-        t1 = time.perf_counter()
-        print(
-            f"[CANCEL-DBG] replica.cancel ray_total={t1 - t0:.3f}s n_servers={len(self.servers)}",
-            flush=True,
-        )
 
     async def resume(self):
         """Resume each rollout server."""
