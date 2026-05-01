@@ -242,7 +242,16 @@ class RolloutPromptManager:
         rollout_prompts = list(itertools.islice(self.done_queue, self.batch_size))
         rollout_samples = []
         for rp in rollout_prompts:
-            full_batch = rp.batch.repeat(repeat_times=self.n, interleave=True).union(rp.gen_batch_output)
+            # DataProto.chunk hands every chunk the same meta_info dict reference
+            # (protocol.py:900), so all rp.batch in this iteration alias one dict.
+            # The first union(...) below mutates that shared dict (e.g. injects
+            # "metrics"); the second rp's union then trips union_two_dict's
+            # equality assert because its own gen_batch_output.meta_info["metrics"]
+            # is a different list object. Snapshot per-iteration to break the
+            # alias before union mutates anything.
+            repeated = rp.batch.repeat(repeat_times=self.n, interleave=True)
+            repeated.meta_info = dict(repeated.meta_info)
+            full_batch = repeated.union(rp.gen_batch_output)
             # epoch=0 is a placeholder: RolloutSample.epoch is required by the
             # dataclass but not read by assemble_batch_from_rollout_samples,
             # and partial rollout doesn't propagate epoch through this queue.
@@ -299,6 +308,15 @@ class RolloutPromptManager:
             seen.add(prompt.prompt_id)
             done_flags.append(is_prompt_done(prompt))
 
+        # appendleft (LIFO): an aborted prompt goes to the head so the next
+        # pull_prompts resumes it while its KV cache may still be live on the
+        # rollout server. Don't change to append() without benchmarking — the
+        # LIFO bias is a deliberate cache-locality optimization, not a fairness
+        # bug.
+        #
+        # Multiple aborted prompts in one push are all cancelled at the same
+        # rollout-cancel barrier, so their relative order isn't meaningful —
+        # we don't bother preserving it.
         for prompt, is_done in zip(prompts, done_flags, strict=True):
             # remove (not discard): assert above guarantees membership, so a
             # KeyError here would mean an internal bug we want to surface.
@@ -306,18 +324,6 @@ class RolloutPromptManager:
             if is_done:
                 self.done_queue.append(prompt)
             else:
-                # appendleft (LIFO): an aborted prompt goes to the head so the
-                # next pull_prompts resumes it while its KV cache may still be
-                # live on the rollout server. Don't change to append() without
-                # benchmarking — the LIFO bias is a deliberate cache-locality
-                # optimization, not a fairness bug.
-                #
-                # Side effect for multi-prompt pushes: appendleft applied per
-                # iteration reverses intra-batch order in pending_queue. Today
-                # callers always push a single prompt (agent_loop.py wraps each
-                # rollout result in [prompt]) so it's invisible. If batch sizes
-                # grow, switch to extendleft(reversed(aborted_subset)) to
-                # preserve order — or decide that the reversal is fine.
                 self.pending_queue.appendleft(prompt)
         # Wake any pull_batch waiter if this push pushed done_queue over the
         # threshold. Hot path for throughput — without this, pull_batch would

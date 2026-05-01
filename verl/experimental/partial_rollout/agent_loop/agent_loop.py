@@ -106,6 +106,10 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             stop_reason_counts: dict = {}
             exc_counts: dict = {}
             done_count = 0
+            # Batch all completed prompts into a single push_prompts.remote() call
+            # to amortize Ray actor RPC overhead. push_prompts already accepts
+            # mixed done/aborted lists (prompt_manager.py:285-321).
+            prompts_to_push: list[RolloutPrompt] = []
             for task in done:
                 running_set.remove(task)
                 try:
@@ -125,12 +129,14 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 except Exception as e:
                     sr = f"<err:{type(e).__name__}>"
                 stop_reason_counts[sr] = stop_reason_counts.get(sr, 0) + 1
-                self.prompt_manager_handle.push_prompts.remote([rollout_prompt])
+                prompts_to_push.append(rollout_prompt)
                 pd = is_prompt_done(rollout_prompt)
                 if pd:
                     done_count += 1
                 if not pd:
                     is_canceled = True
+            if prompts_to_push:
+                self.prompt_manager_handle.push_prompts.remote(prompts_to_push)
             print(f"[WORKER-DBG pid={wpid}] iter {loop_iter}: stop_reasons={stop_reason_counts}, exc_counts={exc_counts}, done_via_is_prompt_done={done_count}/{len(done)}", flush=True)
             if is_canceled:
                 continue
@@ -422,13 +428,20 @@ class PRv3AgentLoopManager(AgentLoopManager):
         # pull_batch is now async server-side and blocks on an internal
         # asyncio.Event until done_queue >= batch_size. One round-trip, no
         # manager-side polling, no per-step ~10k empty Ray RPCs.
+        import time
+        t_pull0 = time.perf_counter()
         output = await self.rollout_prompt_manager.pull_batch.remote()
-        print("[PRv3-DBG] pull_batch got output", flush=True)
-        print("[PRv3-DBG] cancel BEGIN", flush=True)
+        t_pull1 = time.perf_counter()
         await self.cancel()
-        print("[PRv3-DBG] cancel END, gather worker_tasks", flush=True)
+        t_cancel1 = time.perf_counter()
         await asyncio.gather(*worker_tasks)
-        print("[PRv3-DBG] gather DONE", flush=True)
+        t_gather1 = time.perf_counter()
+        print(
+            f"[PRv3-DBG] pull_batch={t_pull1 - t_pull0:.2f}s "
+            f"cancel={t_cancel1 - t_pull1:.2f}s "
+            f"gather={t_gather1 - t_cancel1:.2f}s",
+            flush=True,
+        )
 
         # calculate performance metrics
         # outputs = [output]

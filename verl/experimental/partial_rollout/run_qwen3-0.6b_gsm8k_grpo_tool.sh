@@ -21,7 +21,10 @@ export HTTPS_PROXY=
 # Kept separate from $HOME/data/gsm8k/ so the single-turn run script can
 # coexist without one preprocessor overwriting the other's parquet.
 
-PROJECT_DIR="$(pwd)"
+# Resolve the verl repo root from this script's location, not $(pwd) — the
+# chain runner cd's into verl/experimental/partial_rollout/ before launching.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TOOL_CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/gsm8k_tool_config.yaml"
 
 python3 -m verl.experimental.partial_rollout.main_ppo \
@@ -46,30 +49,24 @@ python3 -m verl.experimental.partial_rollout.main_ppo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold="0.5_2.0" \
-    reward.reward_manager.name=dapo \
-    +reward.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward.reward_kwargs.overlong_buffer_cfg.len=256 \
-    +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward.reward_kwargs.max_resp_len=1024 \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum-norm \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=k3+ \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.offload_policy=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.fsdp_size=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.offload_policy=True \
@@ -84,9 +81,9 @@ python3 -m verl.experimental.partial_rollout.main_ppo \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.max_model_len=2048 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     critic.model.path=Qwen/Qwen3-0.6B \
     critic.optim.lr=1e-5 \
     critic.ppo_micro_batch_size_per_gpu=4 \
