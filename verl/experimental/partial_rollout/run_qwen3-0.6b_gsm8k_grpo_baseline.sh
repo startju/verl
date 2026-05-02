@@ -26,8 +26,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
-    trainer.total_epochs=2 \
-    trainer.total_training_steps=5 \
+    trainer.total_epochs=1 \
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.max_critic_ckpt_to_keep=2 \
     data.train_files=$HOME/data/gsm8k/train.parquet \
