@@ -119,7 +119,13 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
         agent_data.response_logprobs = list(last.response_logprobs or [])
         agent_data.routed_experts = last.routed_experts
         agent_data.user_turns = snapshot.get("user_turns", 0)
-        agent_data.assistant_turns = snapshot.get("assistant_turns", 0)
+        # Compensate the upstream `assistant_turns += 1` that runs at the top of
+        # `_handle_generating_state` (before the abort check, line ~229 of upstream
+        # tool_agent_loop.py): when generation is cancelled mid-flight, the snapshot
+        # already reflects the optimistic +1, and on resume the same line will fire
+        # again for the *same* logical assistant turn. Subtract once to undo the
+        # double-count. Floor at 0 in case snapshot was 0 (defensive).
+        agent_data.assistant_turns = max(0, snapshot.get("assistant_turns", 0) - 1)
         # turn_scores / tool_rewards are written to extra_fields by upstream's
         # _build_output tail; pull them back so cumulative state survives.
         agent_data.turn_scores = list(last.extra_fields.get("turn_scores", []))
