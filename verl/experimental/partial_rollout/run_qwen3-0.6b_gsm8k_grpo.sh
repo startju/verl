@@ -21,7 +21,7 @@ python3 -m verl.experimental.partial_rollout.main_ppo \
     trainer.max_critic_ckpt_to_keep=2 \
     data.train_files=$HOME/data/gsm8k/train.parquet \
     data.val_files=$HOME/data/gsm8k/test.parquet \
-    data.train_batch_size=256 \
+    data.train_batch_size=128 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
     algorithm.adv_estimator=grpo \
@@ -39,7 +39,7 @@ python3 -m verl.experimental.partial_rollout.main_ppo \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
