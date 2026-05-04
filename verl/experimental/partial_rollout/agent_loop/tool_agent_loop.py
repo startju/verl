@@ -50,6 +50,10 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
         else:
             if last_agent_loop_output.extra_fields["stop_reason"] != "aborted":
                 return last_agent_loop_output
+            if len(last_agent_loop_output.response_ids) >= self.response_length:
+                last_agent_loop_output.extra_fields["stop_reason"] = "length"
+                last_agent_loop_output.extra_fields.pop(_SNAPSHOT_KEY, None)
+                return last_agent_loop_output
             agent_data = await self._restore_agent_data(last_agent_loop_output, **kwargs)
             # Prompt is already templated and conversation tokens are intact;
             # jump straight back into another generate call.
