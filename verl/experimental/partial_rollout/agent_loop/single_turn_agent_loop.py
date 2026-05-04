@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.partial_rollout.vllm_rollout.vllm_async_server import set_and_return_max_tokens
 from verl.utils.profiler.performance import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -63,6 +64,14 @@ class PRv3SingleTurnAgentLoop(SingleTurnAgentLoop):
             if last_agent_loop_output.extra_fields["stop_reason"] != "aborted":
                 return last_agent_loop_output
             prompt_ids = last_agent_loop_output.prompt_ids + last_agent_loop_output.response_ids
+            sampling_params = dict(sampling_params)
+            new_max_tokens = set_and_return_max_tokens(
+                sampling_params, self.response_length, len(last_agent_loop_output.response_ids)
+            )
+            if not new_max_tokens:
+                last_agent_loop_output.extra_fields["stop_reason"] = "length"
+                return last_agent_loop_output
+
             metrics["generate_sequences"] = last_agent_loop_output.metrics.generate_sequences
             multi_modal_data = last_agent_loop_output.multi_modal_data or {}
             images = multi_modal_data.get("images")

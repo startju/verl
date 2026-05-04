@@ -24,6 +24,22 @@ from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 
 
+def set_and_return_max_tokens(
+    sampling_params: dict[str, Any], max_response_length: int, last_response_length: int
+) -> int:
+    limit_key = None
+    if "max_tokens" in sampling_params:
+        limit_key = "max_tokens"
+    elif "max_new_tokens" in sampling_params:
+        limit_key = "max_new_tokens"
+    original_max_tokens = min(sampling_params.get(limit_key), max_response_length) if limit_key else max_response_length
+    new_max_tokens = max(0, original_max_tokens - last_response_length)
+    if not limit_key:
+        limit_key = "max_tokens"
+    sampling_params[limit_key] = new_max_tokens
+    return new_max_tokens
+
+
 @ray.remote
 class PRv3vLLMHttpServer(vLLMHttpServer):
     def __init__(
@@ -78,8 +94,8 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
             )
         self.inflight += 1
         token_output = await vLLMHttpServer.generate(
-                    self, prompt_ids, sampling_params, request_id, image_data, video_data, priority
-                )
+            self, prompt_ids, sampling_params, request_id, image_data, video_data, priority
+        )
         self.inflight -= 1
         if token_output.stop_reason == "abort":
             token_output.stop_reason = "aborted"

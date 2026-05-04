@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.partial_rollout.vllm_rollout.vllm_async_server import set_and_return_max_tokens
 from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
@@ -59,7 +60,7 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
             if state == AgentState.PENDING:
                 state = await self._handle_pending_state(agent_data, sampling_params)
             elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
+                state = await self._handle_generating_state_with_budget(agent_data, sampling_params)
             elif state == AgentState.PROCESSING_TOOLS:
                 state = await self._handle_processing_tools_state(agent_data)
             else:
@@ -80,6 +81,16 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
                 "request_id": agent_data.request_id,
             }
         return output
+
+    async def _handle_generating_state_with_budget(
+        self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
+    ) -> AgentState:
+        sp = dict(sampling_params)
+        new_max_tokens = set_and_return_max_tokens(sp, self.response_length, len(agent_data.response_mask))
+        if not new_max_tokens:
+            agent_data.extra_fields["stop_reason"] = "length"
+            return AgentState.TERMINATED
+        return await super()._handle_generating_state(agent_data, sp, ignore_termination)
 
     async def _init_agent_data_fresh(self, **kwargs) -> AgentData:
         messages = list(kwargs["raw_prompt"])
@@ -156,9 +167,7 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
     def _build_output(self, agent_data: AgentData) -> AgentLoopOutput:
         # Same tail as upstream ToolAgentLoop.run; lifted out so resume path can
         # reuse it without re-entering the state machine wrapper.
-        response_ids = (
-            agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
-        )
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {}
         if agent_data.image_data is not None:
@@ -182,7 +191,5 @@ class PRv3ToolAgentLoop(ToolAgentLoop):
             ),
             extra_fields=agent_data.extra_fields,
         )
-        output.extra_fields.update(
-            {"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards}
-        )
+        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
