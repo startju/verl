@@ -40,6 +40,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.max_critic_ckpt_to_keep=2 \
     data.train_files=$HOME/data/math/train.parquet \
     data.val_files=$HOME/data/math/test.parquet \
+    data.filter_overlong_prompts=True \
+    data.truncation=error \
     data.train_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
@@ -47,7 +49,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.rollout_correction.rollout_is=token \
-    algorithm.rollout_correction.rollout_is_threshold="0.5_2.0" \
+    algorithm.rollout_correction.rollout_is_threshold="2.0" \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
