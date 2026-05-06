@@ -35,11 +35,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
-    trainer.total_epochs=3 \
+    trainer.total_epochs=1 \
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.max_critic_ckpt_to_keep=2 \
-    data.train_files=$HOME/data/gsm8k_tool/train.parquet \
-    data.val_files=$HOME/data/gsm8k_tool/test.parquet \
+    data.train_files=$HOME/data/math/train.parquet \
+    data.val_files=$HOME/data/math/test.parquet \
     data.train_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
