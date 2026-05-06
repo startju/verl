@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 set -xeo pipefail
 
-# Baseline counterpart of run_qwen3-0.6b_gsm8k_grpo_tool.sh: native upstream
-# GRPO with tool-call agent loop, NO partial rollout. Differences vs. the PR
-# variant of the tool script:
-#   - python -m verl.trainer.main_ppo (upstream entry, not PRv3)
-#   - default_agent_loop=tool_agent (upstream loop, not prv3_tool_agent)
-#   - same algorithm.rollout_correction.rollout_is settings as the PR variant
-#     (baseline is on-policy → ratios ~1, but keeps the loss code path identical)
-# Same multi-turn / tool config as the PR variant so A/B is apples-to-apples.
-#
-# Dataset note: generate the multi-turn-with-tool dataset before running:
-#   python3 examples/data_preprocess/gsm8k_multiturn_w_tool.py \
-#       --local_save_dir $HOME/data/gsm8k_tool
-
 export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export PYTHONUNBUFFERED=1
 export HTTP_PROXY=
 export HTTPS_PROXY=
 
+# Tool-calling variant of run_qwen3-0.6b_gsm8k_grpo.sh.
+# Differences vs. the single-turn script:
+#   - default_agent_loop=prv3_tool_agent (multi-turn agent loop with tool calls)
+#   - rollout.multi_turn.{enable,tool_config_path,max_assistant_turns} set
+#   - data.return_raw_chat=True so messages list survives to the agent loop
+#   - max_prompt_length / max_response_length doubled to give room for
+#     tool-response turns within the same response budget
+#
+# Dataset note: generate the multi-turn-with-tool dataset before running:
+#   python3 examples/data_preprocess/gsm8k_multiturn_w_tool.py \
+#       --local_save_dir $HOME/data/gsm8k_tool
+# Kept separate from $HOME/data/gsm8k/ so the single-turn run script can
+# coexist without one preprocessor overwriting the other's parquet.
+
 # Resolve the verl repo root from this script's location, not $(pwd) — the
 # chain runner cd's into verl/experimental/partial_rollout/ before launching.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-TOOL_CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/gsm8k_tool_config.yaml"
+TOOL_CONFIG_PATH="$SCRIPT_DIR/gsm8k_tool_config.yaml"
 
-python3 -m verl.trainer.main_ppo \
+python3 -m verl.experimental.partial_rollout.main_ppo \
     trainer.project_name="partial_rollout" \
-    trainer.experiment_name="baseline_tool" \
+    trainer.experiment_name="partial_rollout_tool" \
     trainer.logger=[console,swanlab] \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=2 \
@@ -38,8 +38,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=1 \
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.max_critic_ckpt_to_keep=2 \
-    data.train_files=$HOME/data/math/train.parquet \
-    data.val_files=$HOME/data/math/test.parquet \
+    data.train_files=$HOME/data/gsm8k_tool/train.parquet \
+    data.val_files=$HOME/data/gsm8k_tool/test.parquet \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.train_batch_size=128 \
@@ -75,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
+    actor_rollout_ref.rollout.agent.default_agent_loop=prv3_tool_agent \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$TOOL_CONFIG_PATH" \
@@ -88,4 +88,4 @@ python3 -m verl.trainer.main_ppo \
     critic.model.path=Qwen/Qwen3-0.6B \
     critic.optim.lr=1e-5 \
     critic.ppo_micro_batch_size_per_gpu=4 \
-    2>&1 | tee verl_baseline_tool.log
+    2>&1 | tee verl_partial_rollout_tool.log
